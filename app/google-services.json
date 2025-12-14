@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "51057940705",
+    "project_id": "labsecurityprivacy",
+    "storage_bucket": "labsecurityprivacy.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:51057940705:android:e33df03e2d533f0b517fa0",
+        "android_client_info": {
+          "package_name": "com.example.privacyassistant"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyBwthvG9A6rzt-cYtgGmxOiwKDA1Fzhlew"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
