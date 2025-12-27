@@ -2,6 +2,9 @@ package com.example.privacyassistant
 
 import android.content.Intent
 import android.net.Uri
+import android.content.ComponentName
+import android.content.Context
+import android.provider.Settings
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.ComponentActivity
@@ -37,6 +40,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.sp
 import com.google.firebase.firestore.FirebaseFirestore
@@ -60,24 +64,84 @@ class PvcAssistant : ComponentActivity() {
     private lateinit var dbHandler: DBHandler
     private lateinit var viewModel: ImQuestViewModel
     private lateinit var user: UserHelper
+    @Composable
+    private fun showAccessibilityPrompt() {
+        // Show only once using SharedPreferences
+        val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
+        val hasShownPrompt = prefs.getBoolean("has_shown_accessibility_prompt", false)
 
-    override fun onCreate(savedInstanceState: Bundle?) {
+        if (!hasShownPrompt) {
+            AlertDialog(
+                onDismissRequest = {
+                    // Mark as shown when dismissed
+                    prefs.edit().putBoolean("has_shown_accessibility_prompt", true).apply()
+                },
+                title = { Text("Enable Message Monitoring") },
+                text = {
+                    Text(
+                        "Would you like to enable message monitoring? " +
+                                "This will help analyze Instagram messaging patterns. The service will:\n\n" +
+                                "• Auto-start when you open Instagram\n" +
+                                "• Save contact names when you visit messages\n" +
+                                "• Record message timestamps (not content)\n\n" +
+                                "All data stays on your device and is anonymized."
+                    )
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                        startActivity(intent)
+                        prefs.edit().putBoolean("has_shown_accessibility_prompt", true).apply()
+                    }) {
+                        Text("Enable")
+                    }
+                },
+                dismissButton = {
+                    Row {
+                        TextButton(onClick = {
+                            prefs.edit().putBoolean("has_shown_accessibility_prompt", true).apply()
+                        }) {
+                            Text("Not Now")
+                        }
+                    }
+                }
+            )
+        }
+    }
+
+@Composable
+private fun checkAndSaveServiceState() {
+     val context = LocalContext.current  // Add this line
+    val isEnabled = isAccessibilityServiceEnabled(context)  // Pass context here
+    val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
+    prefs.edit().putBoolean("accessibility_enabled", isEnabled).apply()
+
+    if (!isEnabled) {
+        // Show prompt to enable service
+        showAccessibilityPrompt()
+    }
+}
+    fun isAccessibilityServiceEnabled(context: Context): Boolean {
+        val serviceName = ComponentName(
+            context,
+            MyAccessibilityService::class.java
+        ).flattenToString()
+
+        val enabledServices = Settings.Secure.getString(
+            context.contentResolver,
+            Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+        ) ?: ""
+
+        return enabledServices.contains(serviceName)
+    }
+
+     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         FirebaseFirestore.setLoggingEnabled(true)
 
         dbHandler = DBHandler(this)
         viewModel = dbHandler.createViewModel(this)
         user = UserHelper(-1, -1, -1, -1, -1, -1)
-
-        /*
-
-        CoroutineScope(Dispatchers.IO).launch {
-            Log.d("Debuggah", "Clearing coroutine started.")
-            viewModel.clearAll()
-            Log.d("Debuggah", "Clearing coroutine ended.")
-        }
-
-         */
 
         setContent {
             var isDarkTheme by remember { mutableStateOf(false) }
@@ -106,8 +170,10 @@ class PvcAssistant : ComponentActivity() {
                     onToggleTheme = { isDarkTheme = !isDarkTheme }
                 )
             }
+            checkAndSaveServiceState()
         }
     }
+
 
     @Composable
     fun PvcAssistantScreen(
@@ -167,47 +233,47 @@ class PvcAssistant : ComponentActivity() {
                     )
 
                     2 -> Register(
-                        onReturn = {currentStep--},
-                        onConfirm = {currentStep++}
+                        onReturn = { currentStep-- },
+                        onConfirm = { currentStep++ }
                     )
 
                     3 -> RegisterScreen(
                         user = user,
                         n = 1,
                         text = "I am willing to share personal details in photos if it helps me connect with others.",
-                        onReturn = {currentStep--},
-                        onNext = {currentStep++}
+                        onReturn = { currentStep-- },
+                        onNext = { currentStep++ }
                     )
 
                     4 -> RegisterScreen(
                         user = user,
                         n = 2,
                         text = "I often post photos that show who I am or where I am.",
-                        onReturn = {currentStep--},
-                        onNext = {currentStep++}
+                        onReturn = { currentStep-- },
+                        onNext = { currentStep++ }
                     )
 
                     5 -> RegisterScreen(
                         user = user,
                         n = 3,
                         text = "I remove or block location and other metadata before posting photos.",
-                        onReturn = {currentStep--},
-                        onNext = {currentStep++}
+                        onReturn = { currentStep-- },
+                        onNext = { currentStep++ }
                     )
 
                     6 -> RegisterScreen(
                         user = user,
                         n = 4,
                         text = "People could misuse personal details from the photos I share.",
-                        onReturn = {currentStep--},
-                        onNext = {currentStep++}
+                        onReturn = { currentStep-- },
+                        onNext = { currentStep++ }
                     )
 
                     7 -> RegisterScreen(
                         user = user,
                         n = 5,
                         text = "I worry that my photos could be linked to my identity using face recognition or similar tools.",
-                        onReturn = {currentStep--},
+                        onReturn = { currentStep-- },
                         onNext = {
                             createNewUser(user)
                             currentStep++
@@ -216,7 +282,7 @@ class PvcAssistant : ComponentActivity() {
 
                     8 -> SuccessfulRegistrationScreen(
                         user = user,
-                        onConfirm = {currentStep++}
+                        onConfirm = { currentStep++ }
                     )
 
                     9 -> ImageScreen(
@@ -381,12 +447,10 @@ class PvcAssistant : ComponentActivity() {
 
                     if (userId.isBlank()) {
                         // do nothing
-                    }
-                    else if (userId.toInt() in existingIds) {
+                    } else if (userId.toInt() in existingIds) {
                         viewModel.setUserID(userId.toInt())
                         onLogin()
-                    }
-                    else {
+                    } else {
                         userId = ""
                         placeholderText = "ID does not exist."
                     }
@@ -821,11 +885,17 @@ class PvcAssistant : ComponentActivity() {
                                     color = MaterialTheme.colorScheme.primary
                                 )
                                 Spacer(modifier = Modifier.height(8.dp))
-                                listOf("Close Friends", "All Followers", "Public").forEach { audience ->
+                                listOf(
+                                    "Close Friends",
+                                    "All Followers",
+                                    "Public"
+                                ).forEach { audience ->
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         Checkbox(
                                             checked = selectedAudience.value == audience,
-                                            onCheckedChange = { if (it) selectedAudience.value = audience },
+                                            onCheckedChange = {
+                                                if (it) selectedAudience.value = audience
+                                            },
                                             colors = CheckboxDefaults.colors(
                                                 checkedColor = MaterialTheme.colorScheme.primary
                                             )
@@ -897,13 +967,16 @@ class PvcAssistant : ComponentActivity() {
                                     color = MaterialTheme.colorScheme.primary
                                 )
                                 Spacer(modifier = Modifier.height(8.dp))
-                                val options = listOf("Family", "Close Friends", "Colleagues", "Acquaintances")
+                                val options =
+                                    listOf("Family", "Close Friends", "Colleagues", "Acquaintances")
                                 options.forEach { option ->
                                     Row(verticalAlignment = Alignment.CenterVertically) {
                                         Checkbox(
                                             checked = selectedOptions.contains(option),
                                             onCheckedChange = { checked ->
-                                                if (checked) selectedOptions.add(option) else selectedOptions.remove(option)
+                                                if (checked) selectedOptions.add(option) else selectedOptions.remove(
+                                                    option
+                                                )
                                             },
                                             colors = CheckboxDefaults.colors(
                                                 checkedColor = MaterialTheme.colorScheme.primary
@@ -954,14 +1027,15 @@ class PvcAssistant : ComponentActivity() {
                     shape = RoundedCornerShape(16.dp)
                 ) {
                     val btnText = if (currentIndex < images.size - 1) "Next" else "Finish"
-                    Text(btnText, color = MaterialTheme.colorScheme.onPrimary, fontWeight = FontWeight.Bold)
+                    Text(
+                        btnText,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
         }
     }
-
-
-
 
 
     @Composable
@@ -982,7 +1056,7 @@ class PvcAssistant : ComponentActivity() {
             modifier = Modifier
                 .fillMaxSize()
                 .background(
-                    brush = androidx.compose.ui.graphics.Brush.verticalGradient(
+                    brush = Brush.verticalGradient(
                         colors = listOf(Color(0xFFEDE7F6), Color(0xFFF3E5F5))
                     )
                 ),
