@@ -64,67 +64,11 @@ class PvcAssistant : ComponentActivity() {
     private lateinit var dbHandler: DBHandler
     private lateinit var viewModel: ImQuestViewModel
     private lateinit var user: UserHelper
-    @Composable
-    private fun showAccessibilityPrompt() {
-        // Show only once using SharedPreferences
-        val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
-        val hasShownPrompt = prefs.getBoolean("has_shown_accessibility_prompt", false)
 
-        if (!hasShownPrompt) {
-            AlertDialog(
-                onDismissRequest = {
-                    // Mark as shown when dismissed
-                    prefs.edit().putBoolean("has_shown_accessibility_prompt", true).apply()
-                },
-                title = { Text("Enable Message Monitoring") },
-                text = {
-                    Text(
-                        "Would you like to enable message monitoring? " +
-                                "This will help analyze Instagram messaging patterns. The service will:\n\n" +
-                                "• Auto-start when you open Instagram\n" +
-                                "• Save contact names when you visit messages\n" +
-                                "• Record message timestamps (not content)\n\n" +
-                                "All data stays on your device and is anonymized."
-                    )
-                },
-                confirmButton = {
-                    TextButton(onClick = {
-                        val intent = Intent(android.provider.Settings.ACTION_ACCESSIBILITY_SETTINGS)
-                        startActivity(intent)
-                        prefs.edit().putBoolean("has_shown_accessibility_prompt", true).apply()
-                    }) {
-                        Text("Enable")
-                    }
-                },
-                dismissButton = {
-                    Row {
-                        TextButton(onClick = {
-                            prefs.edit().putBoolean("has_shown_accessibility_prompt", true).apply()
-                        }) {
-                            Text("Not Now")
-                        }
-                    }
-                }
-            )
-        }
-    }
-
-@Composable
-private fun checkAndSaveServiceState() {
-     val context = LocalContext.current  // Add this line
-    val isEnabled = isAccessibilityServiceEnabled(context)  // Pass context here
-    val prefs = getSharedPreferences("app_prefs", MODE_PRIVATE)
-    prefs.edit().putBoolean("accessibility_enabled", isEnabled).apply()
-
-    if (!isEnabled) {
-        // Show prompt to enable service
-        showAccessibilityPrompt()
-    }
-}
-    fun isAccessibilityServiceEnabled(context: Context): Boolean {
+    private fun isAccessibilityServiceEnabled(context: Context): Boolean {
         val serviceName = ComponentName(
             context,
-            MyAccessibilityService::class.java
+            InstagramAccessibilityService::class.java
         ).flattenToString()
 
         val enabledServices = Settings.Secure.getString(
@@ -135,7 +79,7 @@ private fun checkAndSaveServiceState() {
         return enabledServices.contains(serviceName)
     }
 
-     override fun onCreate(savedInstanceState: Bundle?) {
+    override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         FirebaseFirestore.setLoggingEnabled(true)
 
@@ -170,10 +114,8 @@ private fun checkAndSaveServiceState() {
                     onToggleTheme = { isDarkTheme = !isDarkTheme }
                 )
             }
-            checkAndSaveServiceState()
         }
     }
-
 
     @Composable
     fun PvcAssistantScreen(
@@ -184,6 +126,9 @@ private fun checkAndSaveServiceState() {
         val context = LocalContext.current
         var selectedImages by remember { mutableStateOf<List<Uri>>(emptyList()) }
         var currentStep by remember { mutableIntStateOf(0) }
+        
+        // State for accessibility prompt dialog
+        var showAccessibilityDialog by remember { mutableStateOf(false) }
 
         val imagePickerLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.GetMultipleContents()
@@ -207,12 +152,42 @@ private fun checkAndSaveServiceState() {
             onSurface = Color.Black
         )
 
+        // Check accessibility service state on first composition
+        LaunchedEffect(Unit) {
+            val prefs = context.getSharedPreferences("app_prefs", MODE_PRIVATE)
+            val hasShownPrompt = prefs.getBoolean("has_shown_accessibility_prompt", false)
+            val isEnabled = isAccessibilityServiceEnabled(context)
+            prefs.edit().putBoolean("accessibility_enabled", isEnabled).apply()
+            
+            if (!isEnabled && !hasShownPrompt) {
+                showAccessibilityDialog = true
+            }
+        }
+
         MaterialTheme(colorScheme = colorScheme) {
             // Surface to apply background color properly for all screens
             Surface(
                 modifier = Modifier.fillMaxSize(),
                 color = colorScheme.background
             ) {
+                // Show accessibility prompt dialog if needed
+                if (showAccessibilityDialog) {
+                    AccessibilityPromptDialog(
+                        onDismiss = {
+                            val prefs = context.getSharedPreferences("app_prefs", MODE_PRIVATE)
+                            prefs.edit().putBoolean("has_shown_accessibility_prompt", true).apply()
+                            showAccessibilityDialog = false
+                        },
+                        onEnable = {
+                            val prefs = context.getSharedPreferences("app_prefs", MODE_PRIVATE)
+                            prefs.edit().putBoolean("has_shown_accessibility_prompt", true).apply()
+                            val intent = Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+                            context.startActivity(intent)
+                            showAccessibilityDialog = false
+                        }
+                    )
+                }
+
                 when (currentStep) {
 
                     0 -> WelcomeScreen(
@@ -320,9 +295,49 @@ private fun checkAndSaveServiceState() {
         }
     }
 
+    @Composable
+    private fun AccessibilityPromptDialog(
+        onDismiss: () -> Unit,
+        onEnable: () -> Unit
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            title = { Text("Enable Message Monitoring") },
+            text = {
+                Text(
+                    "Would you like to enable message monitoring? " +
+                            "This will help analyze Instagram messaging patterns. The service will:\n\n" +
+                            "• Auto-start when you open Instagram\n" +
+                            "• Save contact names when you visit messages\n" +
+                            "• Record message timestamps (not content)\n\n" +
+                            "All data stays on your device and is anonymized."
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = onEnable) {
+                    Text("Enable")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = onDismiss) {
+                    Text("Not Now")
+                }
+            }
+        )
+    }
+
     private fun createNewUser(user: UserHelper) {
         viewModel.createNewUser(user)
     }
+    // Add inside PvcAssistant class
+private fun checkMonitoringStatus(): String {
+    val service = InstagramAccessibilityService.getInstance()
+    return if (service != null) {
+        "Service running, monitoring DMs: ${service.isMonitoring()}"
+    } else {
+        "Service not running"
+    }
+}
 
     @Composable
     fun WelcomeScreen(

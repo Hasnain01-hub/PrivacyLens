@@ -1,5 +1,7 @@
 package com.example.privacyassistant
 
+import androidx.sqlite.db.SupportSQLiteDatabase
+import androidx.room.RoomDatabase.JournalMode
 import androidx.room.*
 import androidx.room.Dao
 import androidx.room.Database
@@ -48,8 +50,8 @@ interface MessageDao {
 
 @Database(
     entities = [Contact::class, Message::class],
-    version = 1,
-    exportSchema = false
+    version = 2,  
+    exportSchema = true  // Changed to true for debugging
 )
 abstract class InstagramDatabase : RoomDatabase() {
     abstract fun contactDao(): ContactDao
@@ -65,10 +67,32 @@ abstract class InstagramDatabase : RoomDatabase() {
                     context.applicationContext,
                     InstagramDatabase::class.java,
                     "instagram-db"
-                ).fallbackToDestructiveMigration().build()
+                )
+                .fallbackToDestructiveMigration()
+                .setJournalMode(JournalMode.TRUNCATE)  // Better for debugging
+                .addCallback(object : Callback() {
+                    override fun onCreate(db: SupportSQLiteDatabase) {
+                        super.onCreate(db)
+                        android.util.Log.d("InstagramDatabase", "Database created at: ${context.getDatabasePath("instagram-db").absolutePath}")
+                    }
+                    
+                    override fun onOpen(db: SupportSQLiteDatabase) {
+                        super.onOpen(db)
+                        android.util.Log.d("InstagramDatabase", "Database opened")
+                    }
+                })
+                .build()
                 INSTANCE = instance
                 instance
             }
+        }
+        
+        // Method to check if database file exists
+        fun databaseExists(context: android.content.Context): Boolean {
+            val dbFile = context.getDatabasePath("instagram-db")
+            val exists = dbFile.exists()
+            android.util.Log.d("InstagramDatabase", "Database file exists: $exists, path: ${dbFile.absolutePath}")
+            return exists
         }
     }
 }

