@@ -28,29 +28,82 @@ data class Message(
 interface ContactDao {
     @Insert
     suspend fun insert(contact: Contact): Long
-    
+
     @Query("SELECT * FROM contacts ORDER BY timestamp DESC")
     suspend fun getAllContacts(): List<Contact>
-    
+
     @Query("SELECT * FROM contacts WHERE name = :name LIMIT 1")
     suspend fun getContactByName(name: String): Contact?
+
+    // Query with readable timestamp for debugging/export
+    @Query("""
+        SELECT
+            id,
+            name,
+            timestamp,
+            datetime(timestamp/1000, 'unixepoch', 'localtime') as readableTime
+        FROM contacts
+        ORDER BY timestamp DESC
+    """)
+    suspend fun getAllContactsWithReadableTime(): List<ContactWithReadableTime>
 }
+
+// Data class for contacts with readable timestamp
+data class ContactWithReadableTime(
+    val id: Long,
+    val name: String,
+    val timestamp: Long,
+    val readableTime: String  // e.g., "2024-12-30 16:15:17"
+)
 
 @Dao
 interface MessageDao {
     @Insert
     suspend fun insert(message: Message): Long
-    
+
     @Query("SELECT * FROM messages WHERE contactName = :contactName ORDER BY timestamp ASC")
     suspend fun getMessagesByContact(contactName: String): List<Message>
-    
+
     @Query("SELECT DISTINCT contactName FROM messages ORDER BY timestamp DESC")
     suspend fun getAllContactNames(): List<String>
+
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText LIMIT 1")
+    suspend fun findDuplicateMessage(contactName: String, messageText: String): Message?
+
+    @Query("SELECT COUNT(*) FROM messages")
+    suspend fun getMessageCount(): Int
+
+    @Query("SELECT * FROM messages ORDER BY timestamp DESC")
+    suspend fun getAllMessages(): List<Message>
+
+    // Query with readable timestamp for debugging/export
+    @Query("""
+        SELECT
+            id,
+            contactName,
+            messageText,
+            timestamp,
+            datetime(timestamp/1000, 'unixepoch', 'localtime') as readableTime,
+            isSentByUser
+        FROM messages
+        ORDER BY timestamp DESC
+    """)
+    suspend fun getAllMessagesWithReadableTime(): List<MessageWithReadableTime>
 }
+
+// Data class for messages with readable timestamp
+data class MessageWithReadableTime(
+    val id: Long,
+    val contactName: String,
+    val messageText: String,
+    val timestamp: Long,
+    val readableTime: String,  // e.g., "2024-12-30 16:15:17"
+    val isSentByUser: Boolean
+)
 
 @Database(
     entities = [Contact::class, Message::class],
-    version = 2,  
+    version = 3,  // Incremented due to new queries
     exportSchema = true  // Changed to true for debugging
 )
 abstract class InstagramDatabase : RoomDatabase() {
