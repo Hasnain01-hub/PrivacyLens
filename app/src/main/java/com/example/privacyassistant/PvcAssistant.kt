@@ -1,12 +1,15 @@
 package com.example.privacyassistant
 
+import android.Manifest
 import android.content.Intent
 import android.net.Uri
 import android.content.ComponentName
 import android.content.Context
 import android.provider.Settings
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
+import androidx.core.app.ActivityCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -61,6 +64,8 @@ It does the following:
  */
 class PvcAssistant : ComponentActivity() {
 
+    private val NOTIFICATION_PERMISSION_REQUEST_CODE = 1001
+
     private lateinit var dbHandler: DBHandler
     private lateinit var viewModel: ImQuestViewModel
     private lateinit var user: UserHelper
@@ -82,6 +87,15 @@ class PvcAssistant : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         FirebaseFirestore.setLoggingEnabled(true)
+
+        // Request notification permission on Android 13+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ActivityCompat.requestPermissions(
+                this,
+                arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                NOTIFICATION_PERMISSION_REQUEST_CODE
+            )
+        }
 
         dbHandler = DBHandler(this)
         viewModel = dbHandler.createViewModel(this)
@@ -126,9 +140,20 @@ class PvcAssistant : ComponentActivity() {
         val context = LocalContext.current
         var selectedImages by remember { mutableStateOf<List<Uri>>(emptyList()) }
         var currentStep by remember { mutableIntStateOf(0) }
-        
+
         // State for accessibility prompt dialog
         var showAccessibilityDialog by remember { mutableStateOf(false) }
+
+        // Check if user is already logged in on startup
+        LaunchedEffect(Unit) {
+            val prefs = context.getSharedPreferences("app_prefs", MODE_PRIVATE)
+            val savedUserId = prefs.getInt("user_id", -1)
+            if (savedUserId != -1) {
+                // User is logged in, skip to image selection screen
+                viewModel.setUserID(savedUserId)
+                currentStep = 9
+            }
+        }
 
         val imagePickerLauncher = rememberLauncherForActivityResult(
             contract = ActivityResultContracts.GetMultipleContents()
@@ -202,7 +227,10 @@ class PvcAssistant : ComponentActivity() {
                         onRegister = {
                             currentStep++
                         },
-                        onLogin = {
+                        onLogin = { userId ->
+                            // Save user ID to SharedPreferences for session persistence
+                            val prefs = context.getSharedPreferences("app_prefs", MODE_PRIVATE)
+                            prefs.edit().putInt("user_id", userId).apply()
                             currentStep += 8
                         }
                     )
@@ -257,7 +285,12 @@ class PvcAssistant : ComponentActivity() {
 
                     8 -> SuccessfulRegistrationScreen(
                         user = user,
-                        onConfirm = { currentStep++ }
+                        onConfirm = {
+                            // Save user ID to SharedPreferences for session persistence
+                            val prefs = context.getSharedPreferences("app_prefs", MODE_PRIVATE)
+                            prefs.edit().putInt("user_id", user.getID()).apply()
+                            currentStep++
+                        }
                     )
 
                     9 -> ImageScreen(
@@ -282,6 +315,11 @@ class PvcAssistant : ComponentActivity() {
                     }
 
                     12 -> ThankYouScreen(onBackToInstagram = {
+                        // Reset to image selection screen for next time
+                        selectedImages = emptyList()
+                        currentStep = 9
+
+                        // Open Instagram
                         val intent = Intent(Intent.ACTION_VIEW).apply {
                             data = Uri.parse("https://www.instagram.com/create/style/")
                             setPackage("com.instagram.android")
@@ -400,7 +438,7 @@ private fun checkMonitoringStatus(): String {
     @Composable
     fun LoginScreen(
         onRegister: () -> Unit,
-        onLogin: () -> Unit
+        onLogin: (Int) -> Unit
     ) {
         var userId by remember { mutableStateOf("") }
         var placeholderText by remember { mutableStateOf("Enter your User ID") }
@@ -463,8 +501,9 @@ private fun checkMonitoringStatus(): String {
                     if (userId.isBlank()) {
                         // do nothing
                     } else if (userId.toInt() in existingIds) {
-                        viewModel.setUserID(userId.toInt())
-                        onLogin()
+                        val userIdInt = userId.toInt()
+                        viewModel.setUserID(userIdInt)
+                        onLogin(userIdInt)
                     } else {
                         userId = ""
                         placeholderText = "ID does not exist."

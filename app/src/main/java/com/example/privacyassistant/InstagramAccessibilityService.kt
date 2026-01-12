@@ -27,6 +27,7 @@ class InstagramAccessibilityService : AccessibilityService() {
     private lateinit var database: InstagramDatabase
     private lateinit var contactDao: ContactDao
     private lateinit var messageDao: MessageDao
+    private lateinit var notificationHelper: NotificationHelper
     private val ioScope = CoroutineScope(Dispatchers.IO)
 
     private var isInDirectMessages = false
@@ -36,14 +37,19 @@ class InstagramAccessibilityService : AccessibilityService() {
     // Debouncing to prevent rapid-fire captures
     private var lastMessageCaptureTime = 0L
     private var lastContactCaptureTime = 0L
+    private var lastPostDetectionTime = 0L
     private val MESSAGE_CAPTURE_DEBOUNCE_MS = 500L // Wait 500ms between message captures
     private val CONTACT_CAPTURE_DEBOUNCE_MS = 2000L // Wait 2s between contact captures
+    private val POST_DETECTION_DEBOUNCE_MS = 3000L // Wait 3s between post detections
 
     override fun onServiceConnected() {
     super.onServiceConnected()
     instance = this
     Log.d(TAG, "Instagram Accessibility Service Connected")
-    
+
+    // Initialize notification helper for post detection
+    notificationHelper = NotificationHelper(this)
+
     // Configure service
     val info = AccessibilityServiceInfo().apply {
         eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
@@ -105,27 +111,61 @@ class InstagramAccessibilityService : AccessibilityService() {
                 else -> "EVENT_${event.eventType}"
             }
 
-            Log.v(TAG, "Event: $eventTypeName | InDMs: $isInDirectMessages | Chat: $currentChatContact")
+            // Log.v(TAG, "Event: $eventTypeName | InDMs: $isInDirectMessages | Chat: $currentChatContact")
 
             when (event.eventType) {
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
                     val className = event.className?.toString() ?: ""
-                    Log.d(TAG, "━━━ WINDOW CHANGED: $className ━━━")
+                    // Log.d(TAG, "━━━ WINDOW CHANGED: $className ━━━")
 
                     handleWindowChange(className)
                 }
 
                 AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> {
                     if (isInDirectMessages) {
-                        Log.v(TAG, "Content changed in DMs")
+                        // Log.v(TAG, "Content changed in DMs")
                         handleContentChange()
                     }
                 }
 
                 AccessibilityEvent.TYPE_VIEW_CLICKED -> {
-                    // Handle clicks to detect chat openings
+                    // 1. POST DETECTION: Check if user clicked post button
+                    val source = event.source
+                    val viewId = source?.viewIdResourceName ?: ""
+                    val contentDesc = source?.contentDescription?.toString() ?: ""
+                    val text = source?.text?.toString() ?: ""
+                    val className = source?.className?.toString() ?: ""
+
+                    // LOG ALL CLICKS with full details (helps identify Instagram's actual ViewIDs)
+                    // Log.d(TAG, "🔵 CLICK DETECTED:")
+                    // Log.d(TAG, "   ViewID: $viewId")
+                    // Log.d(TAG, "   ContentDesc: $contentDesc")
+                    // Log.d(TAG, "   Text: $text")
+                    // Log.d(TAG, "   ClassName: $className")
+
+                    // SPECIFIC detection for "Create new post" button ONLY
+                    // Based on logs: ContentDesc: "Create new post", ClassName: android.widget.Button
+                    // Do NOT match "Create New" (Stories/Reels button)
+                    val isPostButton = contentDesc.contains("create", ignoreCase = true) &&
+                                       contentDesc.contains("post", ignoreCase = true)
+
+                    if (isPostButton) {
+                        val currentTime = System.currentTimeMillis()
+                        if (currentTime - lastPostDetectionTime >= POST_DETECTION_DEBOUNCE_MS) {
+                            lastPostDetectionTime = currentTime
+                            // Log.d(TAG, "📸 ══════════════════════════════════")
+                            // Log.d(TAG, "📸 Instagram POST ACTION DETECTED!")
+                            // Log.d(TAG, "📸 Showing notification...")
+                            // Log.d(TAG, "📸 ══════════════════════════════════")
+                            notificationHelper.showInstagramPostAssistantNotification()
+                        } else {
+                            // Log.v(TAG, "⏱️ Debouncing post detection (too soon)")
+                        }
+                    }
+
+                    // 2. MESSAGE MONITORING: Handle clicks to detect chat openings
                     if (isInDirectMessages) {
-                        Log.v(TAG, "View clicked in DMs")
+                        // Log.v(TAG, "View clicked in DMs")
                         detectChatOpen()
                     }
                 }
@@ -133,7 +173,7 @@ class InstagramAccessibilityService : AccessibilityService() {
                 AccessibilityEvent.TYPE_VIEW_FOCUSED -> {
                     // Handle focus changes (like opening a chat)
                     if (isInDirectMessages) {
-                        Log.v(TAG, "View focused in DMs")
+                        // Log.v(TAG, "View focused in DMs")
                         detectChatOpen()
                     }
                 }
@@ -144,7 +184,20 @@ class InstagramAccessibilityService : AccessibilityService() {
     }
 
     private fun handleWindowChange(className: String) {
-    Log.d(TAG, "Window change detected: $className")
+    // Log.d(TAG, "Window change detected: $className")
+
+    // POST DETECTION: Check if MediaCaptureActivity opened (camera/gallery screen)
+    if (className.contains("MediaCaptureActivity", ignoreCase = true)) {
+        val currentTime = System.currentTimeMillis()
+        if (currentTime - lastPostDetectionTime >= POST_DETECTION_DEBOUNCE_MS) {
+            lastPostDetectionTime = currentTime
+            // Log.d(TAG, "📸 ══════════════════════════════════")
+            // Log.d(TAG, "📸 MediaCaptureActivity DETECTED!")
+            // Log.d(TAG, "📸 Showing notification...")
+            // Log.d(TAG, "📸 ══════════════════════════════════")
+            notificationHelper.showInstagramPostAssistantNotification()
+        }
+    }
 
     // Instagram activity patterns (2024/2025)
     val dmActivityPatterns = listOf(
@@ -175,12 +228,12 @@ class InstagramAccessibilityService : AccessibilityService() {
         } -> {
             // For ModalActivity, we need to verify it's actually DMs by inspecting content
             if (className.contains("ModalActivity", ignoreCase = true)) {
-                Log.d(TAG, "ModalActivity detected - inspecting UI to confirm DMs...")
+                // Log.d(TAG, "ModalActivity detected - inspecting UI to confirm DMs...")
                 ioScope.launch {
                     delay(800) // Wait for UI to load
                     if (inspectUIForDMs()) {
                         if (!isInDirectMessages) {
-                            Log.d(TAG, ">>> ENTERED Instagram Direct Messages (via ModalActivity) <<<")
+                            // Log.d(TAG, ">>> ENTERED Instagram Direct Messages (via ModalActivity) <<<")
                             isInDirectMessages = true
                             delay(1000)
                             // Detect if we're in a specific chat or the inbox
@@ -190,17 +243,17 @@ class InstagramAccessibilityService : AccessibilityService() {
                             if (currentChatContact == null) {
                                 captureContacts()
                             } else {
-                                Log.d(TAG, "Entered directly into chat with $currentChatContact, skipping contact list capture")
+                                // Log.d(TAG, "Entered directly into chat with $currentChatContact, skipping contact list capture")
                             }
                         }
                     } else {
-                        Log.d(TAG, "ModalActivity is NOT DMs, ignoring")
+                        // Log.d(TAG, "ModalActivity is NOT DMs, ignoring")
                     }
                 }
             } else {
                 // Known DM activity - directly enter DMs
                 if (!isInDirectMessages) {
-                    Log.d(TAG, ">>> ENTERED Instagram Direct Messages <<<")
+                    // Log.d(TAG, ">>> ENTERED Instagram Direct Messages <<<")
                     isInDirectMessages = true
                     ioScope.launch {
                         delay(1500)
@@ -210,7 +263,7 @@ class InstagramAccessibilityService : AccessibilityService() {
 
                 // Check if it's a specific thread (chat)
                 if (className.contains("thread", ignoreCase = true)) {
-                    Log.d(TAG, ">>> IN CHAT THREAD <<<")
+                    // Log.d(TAG, ">>> IN CHAT THREAD <<<")
                     detectChatOpen()
                 }
             }
@@ -221,7 +274,7 @@ class InstagramAccessibilityService : AccessibilityService() {
             className.contains(pattern, ignoreCase = true)
         } -> {
             if (isInDirectMessages) {
-                Log.d(TAG, ">>> EXITED Direct Messages <<<")
+                // Log.d(TAG, ">>> EXITED Direct Messages <<<")
                 isInDirectMessages = false
                 currentChatContact = null
                 processedMessages.clear()
@@ -279,12 +332,12 @@ class InstagramAccessibilityService : AccessibilityService() {
 
             searchForDMIndicators(rootNode)
 
-            if (isDMScreen) {
-                Log.d(TAG, "✓ Confirmed DM screen. Found indicators: ${foundIndicators.take(5).joinToString(", ")}")
-            } else {
-                Log.w(TAG, "✗ Not a DM screen. No DM indicators found. Dumping UI tree for analysis...")
-                dumpUITree(rootNode, maxDepth = 6)
-            }
+            // if (isDMScreen) {
+            //     Log.d(TAG, "✓ Confirmed DM screen. Found indicators: ${foundIndicators.take(5).joinToString(", ")}")
+            // } else {
+            //     Log.w(TAG, "✗ Not a DM screen. No DM indicators found. Dumping UI tree for analysis...")
+            //     dumpUITree(rootNode, maxDepth = 6)
+            // }
 
             rootNode.recycle()
             return isDMScreen
@@ -304,7 +357,7 @@ class InstagramAccessibilityService : AccessibilityService() {
                     lastMessageCaptureTime = currentTime
                     captureNewMessages()
                 } else {
-                    Log.v(TAG, "Debouncing message capture (too soon)")
+                    // Log.v(TAG, "Debouncing message capture (too soon)")
                 }
             } else {
                 // Check if we're actually in inbox or just haven't detected chat contact yet
@@ -314,11 +367,11 @@ class InstagramAccessibilityService : AccessibilityService() {
                         lastContactCaptureTime = currentTime
                         captureContacts()
                     } else {
-                        Log.v(TAG, "Debouncing contact capture (too soon)")
+                        // Log.v(TAG, "Debouncing contact capture (too soon)")
                     }
                 } else {
                     // We're in a chat but haven't detected contact yet - try to detect it
-                    Log.v(TAG, "In chat but contact not detected, attempting detection...")
+                    // Log.v(TAG, "In chat but contact not detected, attempting detection...")
                     detectChatOpen()
                 }
             }
@@ -371,7 +424,7 @@ class InstagramAccessibilityService : AccessibilityService() {
 
             // If we found chat composer, we're in a chat (not inbox)
             val inInbox = !hasChatIndicators
-            Log.v(TAG, "View check: inInbox=$inInbox (hasChatIndicators=$hasChatIndicators, hasInboxIndicators=$hasInboxIndicators)")
+            // Log.v(TAG, "View check: inInbox=$inInbox (hasChatIndicators=$hasChatIndicators, hasInboxIndicators=$hasInboxIndicators)")
             return inInbox
 
         } catch (e: Exception) {
@@ -423,7 +476,7 @@ fun exportDataToFile() {
             delay(500) // Wait a bit for chat to load
             val contactName = findCurrentChatContact()
             if (contactName != null && contactName != currentChatContact) {
-                Log.d(TAG, "Opened chat with: $contactName")
+                // Log.d(TAG, "Opened chat with: $contactName")
                 currentChatContact = contactName
                 // Clear processed messages for this new chat
                 processedMessages.clear()
@@ -437,7 +490,7 @@ fun exportDataToFile() {
     private suspend fun captureContacts() {
         // DISABLED: Inbox contact scanning is unreliable (captures stories, suggestions, etc.)
         // Contacts are now ONLY saved when you open a chat with them (via detectChatOpen)
-        Log.d(TAG, "📋 Contact capture from inbox is disabled - contacts saved only when opening chats")
+        // Log.d(TAG, "📋 Contact capture from inbox is disabled - contacts saved only when opening chats")
         return
 
         /* OLD IMPLEMENTATION - DISABLED
@@ -486,10 +539,10 @@ fun exportDataToFile() {
             var newMessageCount = 0
 
             // DEBUG: If no messages found, dump UI tree to help troubleshoot
-            if (messages.isEmpty()) {
-                Log.w(TAG, "⚠️ No messages found in UI tree. Dumping UI structure for debugging...")
-                dumpUITree(rootNode, maxDepth = 8)
-            }
+            // if (messages.isEmpty()) {
+            //     Log.w(TAG, "⚠️ No messages found in UI tree. Dumping UI structure for debugging...")
+            //     dumpUITree(rootNode, maxDepth = 8)
+            // }
 
             messages.forEach { messageNode ->
                 val messageText = extractMessageText(messageNode)
@@ -519,16 +572,16 @@ fun exportDataToFile() {
                         val messageId = messageDao.insert(message)
                         newMessageCount++
                         val direction = if (isSentByUser) "SENT" else "RECEIVED"
-                        Log.d(TAG, "✓ Saved NEW message [$direction] from $contactName (ID: $messageId): '$messageText'")
+                        // Log.d(TAG, "✓ Saved NEW message [$direction] from $contactName (ID: $messageId): '$messageText'")
                     } else {
-                        Log.v(TAG, "⊘ Skipped DUPLICATE message from $contactName: '$messageText'")
+                        // Log.v(TAG, "⊘ Skipped DUPLICATE message from $contactName: '$messageText'")
                     }
                 }
             }
 
             if (newMessageCount > 0) {
                 val totalMessages = messageDao.getMessageCount()
-                Log.d(TAG, ">>> Captured $newMessageCount new messages. Total in DB: $totalMessages <<<")
+                // Log.d(TAG, ">>> Captured $newMessageCount new messages. Total in DB: $totalMessages <<<")
             }
 
             rootNode.recycle()
@@ -577,7 +630,7 @@ fun exportDataToFile() {
                     timestamp = System.currentTimeMillis()
                 )
                 contactDao.insert(contact)
-                Log.d(TAG, "Saved new contact: $contactName")
+                // Log.d(TAG, "Saved new contact: $contactName")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error saving contact: ${e.message}")
@@ -610,9 +663,9 @@ fun exportDataToFile() {
     
     fun searchNodes(node: AccessibilityNodeInfo, depth: Int = 0) {
         // Log node details for debugging (remove in production)
-        if (node.text != null && node.text.isNotEmpty()) {
-            Log.v(TAG, "Node[depth=$depth]: text='${node.text}', viewId='${node.viewIdResourceName}', class='${node.className}'")
-        }
+        // if (node.text != null && node.text.isNotEmpty()) {
+        //     Log.v(TAG, "Node[depth=$depth]: text='${node.text}', viewId='${node.viewIdResourceName}', class='${node.className}'")
+        // }
         
         // Check if this node might be a contact name
         if (node.text != null && node.text.isNotEmpty()) {
@@ -662,10 +715,10 @@ fun exportDataToFile() {
                 !timePattern.matches(text) && // Exclude timestamps "16:04"
                 !paginationPattern.matches(text) && // Exclude pagination "1/7"
                 text != "@" // Allow @usernames but not just "@"
-            
+
             if ((matchesViewIdPattern || matchesClassPattern) && isValidContact) {
                 contacts.add(text)
-                Log.d(TAG, "Found contact: $text (viewId: $viewId)")
+                // Log.d(TAG, "Found contact: $text (viewId: $viewId)")
             }
         }
         
@@ -732,10 +785,10 @@ fun exportDataToFile() {
                     !text.contains("Instagram", ignoreCase = true) && // App name
                     !text.contains("Search", ignoreCase = true) &&    // Search UI
                     !text.all { it.isDigit() }
-                
+
                 if (isHeader && isValidContactName) {
                     contactName = text
-                    Log.d(TAG, "Found chat contact in header: $text")
+                    // Log.d(TAG, "Found chat contact in header: $text")
                     return
                 }
             }
@@ -830,18 +883,18 @@ fun exportDataToFile() {
                 // Only accept if it matches the specific message ViewID pattern AND passes all filters
                 if (matchesMessageViewId && isTextView && isNotUIElement && text.length in 1..1000) {
                     // Log for debugging
-                    Log.v(TAG, "✓ Valid message [depth=$depth]: '$text' (viewId: $viewId)")
+                    // Log.v(TAG, "✓ Valid message [depth=$depth]: '$text' (viewId: $viewId)")
                     messages.add(AccessibilityNodeInfo.obtain(node))
                 } else if (text.length < 100) {
                     // Log rejected messages for debugging (only short text to avoid spam)
-                    val reason = when {
-                        !matchesMessageViewId -> "wrong ViewID"
-                        !isTextView -> "not TextView"
-                        !isNotUIElement -> "UI element"
-                        timePattern.matches(text) -> "timestamp"
-                        else -> "unknown"
-                    }
-                    Log.v(TAG, "✗ Rejected [$reason]: '$text' (viewId: ${viewId.substringAfterLast(':')})")
+                    // val reason = when {
+                    //     !matchesMessageViewId -> "wrong ViewID"
+                    //     !isTextView -> "not TextView"
+                    //     !isNotUIElement -> "UI element"
+                    //     timePattern.matches(text) -> "timestamp"
+                    //     else -> "unknown"
+                    // }
+                    // Log.v(TAG, "✗ Rejected [$reason]: '$text' (viewId: ${viewId.substringAfterLast(':')})")
                 }
             }
 
@@ -886,7 +939,7 @@ fun exportDataToFile() {
                     contentDesc.contains("sent by you", ignoreCase = true) ||
                     contentDesc.contains("your message", ignoreCase = true)) {
                     if (currentNode != node) currentNode.recycle()
-                    Log.d(TAG, "📍 Detected SENT via contentDesc")
+                    // Log.d(TAG, "📍 Detected SENT via contentDesc")
                     return true
                 }
 
@@ -894,7 +947,7 @@ fun exportDataToFile() {
                     contentDesc.contains("received", ignoreCase = true) ||
                     contentDesc.contains("their message", ignoreCase = true)) {
                     if (currentNode != node) currentNode.recycle()
-                    Log.d(TAG, "📍 Detected RECEIVED via contentDesc")
+                    // Log.d(TAG, "📍 Detected RECEIVED via contentDesc")
                     return false
                 }
 
@@ -903,14 +956,14 @@ fun exportDataToFile() {
                 if (viewId.contains("outgoing", ignoreCase = true) ||
                     viewId.contains("sent", ignoreCase = true)) {
                     if (currentNode != node) currentNode.recycle()
-                    Log.d(TAG, "📍 Detected SENT via viewId")
+                    // Log.d(TAG, "📍 Detected SENT via viewId")
                     return true
                 }
 
                 if (viewId.contains("incoming", ignoreCase = true) ||
                     viewId.contains("received", ignoreCase = true)) {
                     if (currentNode != node) currentNode.recycle()
-                    Log.d(TAG, "📍 Detected RECEIVED via viewId")
+                    // Log.d(TAG, "📍 Detected RECEIVED via viewId")
                     return false
                 }
 
@@ -923,7 +976,7 @@ fun exportDataToFile() {
                 val width = bounds.width()
                 if (width > 100 && width < screenWidth * 0.8) {
                     messageBubbleBounds = bounds
-                    Log.v(TAG, "Found bubble candidate at depth $depth: width=$width, bounds=$bounds")
+                    // Log.v(TAG, "Found bubble candidate at depth $depth: width=$width, bounds=$bounds")
                 }
 
                 // Move to parent
@@ -950,8 +1003,8 @@ fun exportDataToFile() {
             // Received messages: right edge should be < 80% of screen
             val isSent = left > (screenWidth * 0.2)
 
-            val position = if (isSent) "RIGHT (sent)" else "LEFT (received)"
-            Log.d(TAG, "📍 Position: msg='${node.text?.toString()?.take(20)}', left=$left, right=$right, screenWidth=$screenWidth, position=$position, isSent=$isSent")
+            // val position = if (isSent) "RIGHT (sent)" else "LEFT (received)"
+            // Log.d(TAG, "📍 Position: msg='${node.text?.toString()?.take(20)}', left=$left, right=$right, screenWidth=$screenWidth, position=$position, isSent=$isSent")
 
             return isSent
 
