@@ -18,10 +18,13 @@ data class Contact(
 @Entity(tableName = "messages")
 data class Message(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-    val contactName: String,
-    val messageText: String,
+     val contactName: String,
+    val messageText: String?,  // Changed to nullable for gifts
     val timestamp: Long = System.currentTimeMillis(),
-    val isSentByUser: Boolean = false
+    val isSentByUser: Boolean = false,
+    val isGift: Int = 0,  // 0 = not a gift, 1 = is a gift
+    val replyToMessageId: Long? = null,  // Reference to original message if this is a reply
+    val replyToMessageText: String? = null 
 )
 
 @Dao
@@ -61,6 +64,12 @@ interface MessageDao {
     @Insert
     suspend fun insert(message: Message): Long
 
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText AND replyToMessageText = :replyToMessageText LIMIT 1")
+    suspend fun findDuplicateMessageWithReply(contactName: String, messageText: String?, replyToMessageText: String?): Message?
+    
+    @Query("SELECT * FROM messages WHERE id = :messageId LIMIT 1")
+    suspend fun getMessageById(messageId: Long): Message?
+
     @Query("SELECT * FROM messages WHERE contactName = :contactName ORDER BY timestamp ASC")
     suspend fun getMessagesByContact(contactName: String): List<Message>
 
@@ -84,7 +93,10 @@ interface MessageDao {
             messageText,
             timestamp,
             datetime(timestamp/1000, 'unixepoch', 'localtime') as readableTime,
-            isSentByUser
+            isSentByUser,
+            isGift,
+            replyToMessageId,
+            replyToMessageText
         FROM messages
         ORDER BY timestamp DESC
     """)
@@ -93,17 +105,20 @@ interface MessageDao {
 
 // Data class for messages with readable timestamp
 data class MessageWithReadableTime(
-    val id: Long,
+      val id: Long,
     val contactName: String,
-    val messageText: String,
+    val messageText: String?,
     val timestamp: Long,
-    val readableTime: String,  // e.g., "2024-12-30 16:15:17"
-    val isSentByUser: Boolean
+    val readableTime: String,
+    val isSentByUser: Boolean,
+    val isGift: Int,
+    val replyToMessageId: Long?,
+    val replyToMessageText: String?
 )
 
 @Database(
     entities = [Contact::class, Message::class],
-    version = 3,  // Incremented due to new queries
+    version = 4,  // Incremented due to new queries
     exportSchema = true  // Changed to true for debugging
 )
 abstract class InstagramDatabase : RoomDatabase() {
