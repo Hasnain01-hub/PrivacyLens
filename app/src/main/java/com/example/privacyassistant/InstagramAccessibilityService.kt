@@ -15,6 +15,18 @@ import kotlinx.coroutines.launch
 import java.text.SimpleDateFormat
 import java.util.*
 
+data class MessageData(
+    val messageText: String?,
+    val isGift: Int,
+    val replyToText: String?
+) {
+    fun isValid(): Boolean {
+        // Valid if has text, is a gift, or is a reply
+        return !messageText.isNullOrBlank() || isGift == 1 || replyToText != null
+    }
+}
+
+
 class InstagramAccessibilityService : AccessibilityService() {
 
     companion object {
@@ -148,6 +160,117 @@ class InstagramAccessibilityService : AccessibilityService() {
             Log.e(TAG, "Error processing event: ${e.message}", e)
         }
     }
+
+
+private fun extractMessageData(messageNode: AccessibilityNodeInfo): MessageData {
+    var messageText: String? = null
+    var replyText: String? = null
+    var isGift = 0
+    
+    // Extract main message text
+    messageText = extractMessageText(messageNode)
+    
+    // Check for gift indicators
+    val contentDesc = messageNode.contentDescription?.toString() ?: ""
+    val viewId = messageNode.viewIdResourceName ?: ""
+    
+    if (contentDesc.contains("gift", ignoreCase = true) ||
+        contentDesc.contains("sent a gift", ignoreCase = true) ||
+        viewId.contains("gift", ignoreCase = true) ||
+        (messageText.isNullOrBlank() && contentDesc.contains("sent", ignoreCase = true))) {
+        isGift = 1
+        if (messageText.isNullOrBlank()) {
+            messageText = null // Explicitly null for gifts without text
+        }
+    }
+    
+    // Look for reply context in parent/sibling nodes
+    replyText = findReplyContext(messageNode)
+    
+    return MessageData(messageText, isGift, replyText)
+}
+
+private fun findReplyContext(messageNode: AccessibilityNodeInfo): String? {
+    try {
+        // Check the message node's parent hierarchy for reply indicators
+        var currentNode: AccessibilityNodeInfo? = messageNode.parent
+        var depth = 0
+        val maxDepth = 5
+        
+        while (currentNode != null && depth < maxDepth) {
+            // Look for reply container
+            val viewId = currentNode.viewIdResourceName ?: ""
+            val contentDesc = currentNode.contentDescription?.toString() ?: ""
+            
+            if (viewId.contains("reply", ignoreCase = true) ||
+                contentDesc.contains("replying to", ignoreCase = true) ||
+                contentDesc.contains("replied to", ignoreCase = true)) {
+                
+                // Search children for the original message text
+                val replyText = findReplyTextInNode(currentNode)
+                if (replyText != null) {
+                    currentNode.recycle()
+                    return replyText
+                }
+            }
+            
+            val parent = currentNode.parent
+            currentNode.recycle()
+            currentNode = parent
+            depth++
+        }
+        
+        currentNode?.recycle()
+        
+        // Also check siblings for reply preview
+        val parentNode = messageNode.parent
+        if (parentNode != null) {
+            for (i in 0 until parentNode.childCount) {
+                val sibling = parentNode.getChild(i)
+                if (sibling != null) {
+                    val siblingViewId = sibling.viewIdResourceName ?: ""
+                    if (siblingViewId.contains("reply", ignoreCase = true) ||
+                        siblingViewId.contains("quoted", ignoreCase = true)) {
+                        val replyText = findReplyTextInNode(sibling)
+                        sibling.recycle()
+                        if (replyText != null) {
+                            parentNode.recycle()
+                            return replyText
+                        }
+                    }
+                    sibling.recycle()
+                }
+            }
+            parentNode.recycle()
+        }
+        
+    } catch (e: Exception) {
+        Log.e(TAG, "Error finding reply context: ${e.message}")
+    }
+    
+    return null
+}
+
+private fun findReplyTextInNode(node: AccessibilityNodeInfo): String? {
+    // Search this node and immediate children for reply text
+    val text = node.text?.toString()?.trim()
+    if (!text.isNullOrBlank() && text.length in 1..200) {
+        return text
+    }
+    
+    for (i in 0 until node.childCount) {
+        val child = node.getChild(i)
+        if (child != null) {
+            val childText = child.text?.toString()?.trim()
+            child.recycle()
+            if (!childText.isNullOrBlank() && childText.length in 1..200) {
+                return childText
+            }
+        }
+    }
+    
+    return null
+}
 
     private fun handleWindowChange(className: String) {
     if (className.contains("MediaCaptureActivity", ignoreCase = true)) {
@@ -374,7 +497,12 @@ fun exportDataToFile() {
                     out.println("\n[$contactName] - ${msgs.size} messages")
                     msgs.forEach { msg ->
                         val direction = if (msg.isSentByUser) "SENT" else "RECEIVED"
-                        out.println("  [${msg.readableTime}] [$direction] ${msg.messageText}")
+                        val giftIndicator = if (msg.isGift == 1) " [GIFT]" else ""
+                        val replyInfo = if (msg.replyToMessageText != null) 
+                            " (↩️ Reply to: \"${msg.replyToMessageText}\")" else ""
+                        val messageContent = msg.messageText ?: "[Gift/Media]"
+                        
+                        out.println("  [${msg.readableTime}] [$direction]$giftIndicator $messageContent$replyInfo")
                     }
                 }
             }
@@ -399,52 +527,77 @@ fun exportDataToFile() {
     }
 
     private suspend fun captureContacts() {
-        // DISABLED: Inbox contact scanning is unreliable
-        // Contacts are now ONLY saved when you open a chat with them
-        return
-    }
-
-    private suspend fun captureNewMessages() {
         try {
             val rootNode = rootInActiveWindow ?: return
-            val contactName = currentChatContact ?: "Unknown"
+            val contactNames = findContactNames(rootNode)
 
-            val messages = findMessageNodes(rootNode)
-            var newMessageCount = 0
-
-            messages.forEach { messageNode ->
-                val messageText = extractMessageText(messageNode)
-
-                if (messageText.isNotBlank()) {
-                    val messageHash = "$contactName-$messageText"
-                    val existsInMemory = processedMessages.contains(messageHash)
-                    val existsInDb = messageDao.findDuplicateMessage(contactName, messageText) != null
-
-                    if (!existsInMemory && !existsInDb) {
-                        processedMessages.add(messageHash)
-
-                        val isSentByUser = isMessageSentByUser(messageNode)
-                        val timestamp = System.currentTimeMillis()
-
-                        val message = Message(
-                            id = 0,
-                            contactName = contactName,
-                            messageText = messageText,
-                            timestamp = timestamp,
-                            isSentByUser = isSentByUser
-                        )
-
-                        messageDao.insert(message)
-                        newMessageCount++
-                    }
-                }
+            contactNames.forEach { name ->
+                saveContact(name)
             }
 
             rootNode.recycle()
         } catch (e: Exception) {
-            Log.e(TAG, "Error capturing messages: ${e.message}", e)
+            Log.e(TAG, "Error capturing contacts: ${e.message}")
         }
+        return
     }
+
+private suspend fun captureNewMessages() {
+    try {
+        val rootNode = rootInActiveWindow ?: return
+        val contactName = currentChatContact ?: "Unknown"
+
+        val messages = findMessageNodes(rootNode)
+        var newMessageCount = 0
+
+        messages.forEach { messageNode ->
+            val messageData = extractMessageData(messageNode)
+            
+            if (messageData.isValid()) {
+                val messageHash = "$contactName-${messageData.messageText}-${messageData.replyToText}"
+                val existsInMemory = processedMessages.contains(messageHash)
+                
+                // Check for duplicate with reply context
+                val existsInDb = if (messageData.replyToText != null) {
+                    messageDao.findDuplicateMessageWithReply(
+                        contactName, 
+                        messageData.messageText, 
+                        messageData.replyToText
+                    ) != null
+                } else {
+                    messageDao.findDuplicateMessage(contactName, messageData.messageText ?: "") != null
+                }
+
+                if (!existsInMemory && !existsInDb) {
+                    processedMessages.add(messageHash)
+
+                    val isSentByUser = isMessageSentByUser(messageNode)
+                    val timestamp = System.currentTimeMillis()
+
+                    val message = Message(
+                        id = 0,
+                        contactName = contactName,
+                        messageText = messageData.messageText,
+                        timestamp = timestamp,
+                        isSentByUser = isSentByUser,
+                        isGift = messageData.isGift,
+                        replyToMessageId = null, // Could be linked later if needed
+                        replyToMessageText = messageData.replyToText
+                    )
+
+                    messageDao.insert(message)
+                    newMessageCount++
+                    
+                    Log.d(TAG, "Captured message: ${if (messageData.isGift == 1) "[GIFT]" else messageData.messageText}${if (messageData.replyToText != null) " (reply to: ${messageData.replyToText})" else ""}")
+                }
+            }
+        }
+
+        rootNode.recycle()
+    } catch (e: Exception) {
+        Log.e(TAG, "Error capturing messages: ${e.message}", e)
+    }
+}
 
     private fun dumpUITree(node: AccessibilityNodeInfo?, depth: Int = 0, maxDepth: Int = 10) {
         if (node == null || depth > maxDepth) return
