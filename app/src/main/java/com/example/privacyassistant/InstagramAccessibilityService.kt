@@ -647,11 +647,11 @@ private suspend fun captureNewMessages() {
 
                 // For text messages: store the actual text in messageText
                 // For media messages: store EMPTY string in messageText (user requirement)
-                val messageText = if (assetType == AssetType.TEXT) {
-                    detected.text
-                } else {
-                    "" // Empty for all media types
-                }
+                val messageText: String? = when (assetType) {
+                        AssetType.TEXT -> detected.text
+                        AssetType.GIFT -> null              // <-- gift must be null
+                        else -> ""                          // other media stays empty
+                    }
 
                 if (assetType == AssetType.TEXT && detected.text.isBlank()) {
                     // Skip blank text messages
@@ -1286,37 +1286,74 @@ private suspend fun captureNewMessages() {
      * These should NOT be detected as new messages.
      */
     private fun isInsideReplyBar(node: AccessibilityNodeInfo): Boolean {
-        var current: AccessibilityNodeInfo? = node
-        var depth = 0
-        val ancestors = mutableListOf<String>()
+    var current: AccessibilityNodeInfo? = node
+    var depth = 0
 
-        while (current != null && depth < 10) {
-            val viewId = current.viewIdResourceName ?: ""
-            val viewIdShort = viewId.substringAfterLast('/')?.substringAfterLast(':') ?: ""
+    var hasComposerAncestor = false
 
-            if (viewIdShort.isNotBlank()) {
-                ancestors.add(viewIdShort)
-            }
+    while (current != null && depth < 12) {
+        val viewId = current.viewIdResourceName ?: ""
+        val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
+        val className = current.className?.toString() ?: ""
 
-            // Check if this is the reply bar container
-            if (viewIdShort.equals("message_reply_bar", ignoreCase = true) ||
+        // ✅ Anchor: if we are near/inside the message input area, treat as composer context
+        if (
+            viewIdShort.contains("composer", ignoreCase = true) ||
+            viewIdShort.contains("thread_composer", ignoreCase = true) ||
+            viewIdShort.contains("row_thread_composer", ignoreCase = true) ||
+            viewIdShort.contains("composer_edittext", ignoreCase = true) ||
+            className.contains("EditText", ignoreCase = true)
+        ) {
+            hasComposerAncestor = true
+        }
+
+        // ✅ Only exclude quoted/reply nodes if they are inside composer area
+        if (hasComposerAncestor) {
+            if (
+                viewIdShort.equals("message_reply_bar", ignoreCase = true) ||
                 viewIdShort.equals("quoted_message_subtitle", ignoreCase = true) ||
-                viewIdShort.equals("quoted_message_info", ignoreCase = true)) {
+                viewIdShort.equals("quoted_message_info", ignoreCase = true) ||
+                viewIdShort.equals("quoted_message_container", ignoreCase = true)
+            ) {
                 if (ULTRA_DEEP_LOGGING) {
-                    Log.d(TAG, "🚫 NODE IS INSIDE REPLY BAR: Found ancestor '$viewIdShort' at depth $depth")
+                    Log.d(TAG, "🚫 NODE IS INSIDE COMPOSER REPLY BAR: ancestor='$viewIdShort' depth=$depth")
                 }
                 return true
             }
-
-            current = current.parent
-            depth++
         }
 
-        if (ULTRA_DEEP_LOGGING && ancestors.isNotEmpty()) {
-            Log.v(TAG, "  Ancestor chain: ${ancestors.joinToString(" > ")}")
-        }
-        return false
+        current = current.parent
+        depth++
     }
+
+    return false
+}
+
+
+fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean {
+    if (n == null || depth > 6) return false
+    val t = n.text?.toString()?.lowercase() ?: ""
+    val d = n.contentDescription?.toString()?.lowercase() ?: ""
+    val id = (n.viewIdResourceName ?: "").lowercase()
+
+    // add more keywords if your device language differs (DE: "geschenk", etc.)
+    val hit = id.contains("gift") ||
+            d.contains("gift") || d.contains("sent a gift") ||
+            t.contains("gift") || t.contains("sent a gift")
+
+    if (hit) return true
+
+    for (i in 0 until n.childCount) {
+        val c = n.getChild(i)
+        val found = nodeContainsGiftKeyword(c, depth + 1)
+        c?.recycle()
+        if (found) return true
+    }
+    return false
+}
+
+
+
 
     private fun findMessageNodes(rootNode: AccessibilityNodeInfo): List<DetectedMessage> {
         val messages = mutableListOf<DetectedMessage>()
@@ -1333,7 +1370,8 @@ private suspend fun captureNewMessages() {
             "animated_image",    // Stickers and GIFs
             "media_flat",        // Photos and videos
             "media_container",   // Photos and videos (FrameLayout container with content desc)
-            "message_content_voice_playback_timer"   // Voice messages (TextView with this specific ID)
+            "message_content_voice_playback_timer",   // Voice messages (TextView with this specific ID)
+             "gift"
         )
 
         // ViewIDs to EXCLUDE (not messages)
@@ -1378,8 +1416,33 @@ private suspend fun captureNewMessages() {
             // Extract just the ID name: "com.instagram.android:id/animated_image" -> "animated_image"
             // or "id/animated_image" -> "animated_image"
             val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
+            val looksLikeGift = nodeContainsGiftKeyword(node)
 
-            // Reply detection logging removed - now handled by detectReplyContext()
+                        if (looksLikeGift) {
+                            // Use position to avoid duplicates within the same scan
+                            val bounds = android.graphics.Rect()
+                            node.getBoundsInScreen(bounds)
+                            val giftId = "gift-${bounds.top}-${bounds.left}"
+
+                            if (!processedMediaIds.contains(giftId)) {
+                                processedMediaIds.add(giftId)
+
+                                // Keep detected.text as contentDesc for logging/dedup keys;
+                                // DB messageText will be set to null in captureNewMessages()
+                                val giftDesc = if (contentDesc.isNotBlank()) contentDesc else "Gift"
+
+                                val quotedMessageText = findQuotedMessageInBubble(node)
+                                messages.add(
+                                    DetectedMessage(
+                                        text = giftDesc,
+                                        assetType = AssetType.GIFT,
+                                        node = AccessibilityNodeInfo.obtain(node),
+                                        quotedMessageText = quotedMessageText
+                                    )
+                                )
+                                Log.d(TAG, "🎁 GIFT DETECTED: '$giftDesc' at pos(${bounds.left},${bounds.top})")
+                            }
+                        }
 
             // EXCLUDE nodes with specific ViewIDs (timestamps, status, etc.)
             val isExcludedViewId = excludedViewIds.any { excluded ->
