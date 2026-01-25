@@ -601,6 +601,42 @@ fun exportDataToFile() {
         }
         return
     }
+    
+private fun sha256(s: String): String {
+    val md = java.security.MessageDigest.getInstance("SHA-256")
+    val bytes = md.digest(s.toByteArray(Charsets.UTF_8))
+    return bytes.joinToString("") { "%02x".format(it) }
+}
+
+private fun normalizeDesc(raw: String): String =
+    raw.trim()
+        .lowercase()
+        .replace(Regex("\\s+"), " ")
+        .replace(Regex("^.+? sent (a|an) "), "sent ")
+
+private fun buildFingerprint(
+    contactName: String,
+    assetType: String,
+    isSentByUser: Boolean,
+    messageText: String?,
+    detectedDesc: String?,
+    replyMessageID: Long?
+): String {
+    val base = when (assetType) {
+        AssetType.TEXT -> "t|$isSentByUser|${messageText.orEmpty().trim()}"
+        AssetType.GIFT -> "g|$isSentByUser" // gifts have null text by your rule
+        else -> {
+            // media fingerprint should NOT use bounds (bounds change when you reopen/scroll)
+            val d = normalizeDesc(detectedDesc.orEmpty())
+            "m|$assetType|$isSentByUser|$d"
+        }
+    }
+
+    // Include reply id if available so same text can exist once as reply and once normal (optional)
+    val replyPart = replyMessageID?.let { "|r:$it" } ?: ""
+
+    return sha256("$contactName|$base$replyPart")
+}
 
 private suspend fun captureNewMessages() {
     try {
@@ -634,10 +670,12 @@ private suspend fun captureNewMessages() {
             val currentTime = System.currentTimeMillis()
 
             // Clean up old entries from caches (keep only last 60 seconds)
-            val cacheCleanupThreshold = currentTime - 60000L
+            val cacheCleanupThreshold = currentTime - maxOf(
+                SENT_MESSAGE_DUPLICATE_WINDOW_MS,
+                RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS
+            )
             textMessageCache.entries.removeIf { it.value < cacheCleanupThreshold }
             mediaContentCache.entries.removeIf { it.value < cacheCleanupThreshold }
-
             // Process each detected message
             detectedMessages.forEach { detected ->
                 val assetType = detected.assetType
@@ -707,20 +745,31 @@ private suspend fun captureNewMessages() {
                     // This allows us to:
                     // - Skip the SAME media when detected again due to scrolling
                     // - Save DIFFERENT media even if sent close together
-                    val contentDescription = detected.text // This contains the content description for media
-                    val mediaKey = "$contactName-$assetType-$contentDescription"
+                    val bounds = android.graphics.Rect()
+detected.node.getBoundsInScreen(bounds)
 
-                    val lastSeenTime = mediaContentCache[mediaKey]
+// Normalize content description (Instagram often repeats the same string or includes usernames)
+val rawDesc = detected.text.orEmpty().trim()
+val normalizedDesc = rawDesc
+    .lowercase()
+    .replace(Regex("\\s+"), " ")
+    .replace(Regex("^.+? sent (a|an) "), "sent ")
 
-                    if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS) {
-                        // Either never seen before, or seen long ago → safe to save
-                        shouldSave = true
-                        mediaContentCache[mediaKey] = currentTime
-                    } else {
-                        // Seen recently → likely scroll duplicate, skip
-                        Log.d(TAG, "⏭️ SKIP [$assetType] - seen ${currentTime - lastSeenTime}ms ago: '$contentDescription'")
-                    }
-                }
+val mediaKey = if (normalizedDesc.isNotBlank()) {
+    "$contactName-$assetType-$isSentByUser-$normalizedDesc"
+} else {
+    // If desc is empty, DON'T try to dedupe here by bounds; let DB fingerprint handle it
+    "$contactName-$assetType-$isSentByUser-no_desc"
+}
+
+val lastSeenTime = mediaContentCache[mediaKey]
+if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS) {
+    shouldSave = true
+    mediaContentCache[mediaKey] = currentTime
+} else {
+    Log.d(TAG, "⏭️ SKIP [$assetType] duplicate ${currentTime - lastSeenTime}ms ago key='$mediaKey'")
+}
+}
 
                 if (shouldSave) {
                     val timestamp = System.currentTimeMillis()
@@ -775,6 +824,22 @@ private suspend fun captureNewMessages() {
                         }
                     }
 
+                        val fp = buildFingerprint(
+                            contactName = contactName,
+                            assetType = assetType,
+                            isSentByUser = isSentByUser,
+                            messageText = messageText,
+                            detectedDesc = if (assetType == AssetType.TEXT) null else detected.text,
+                            replyMessageID = replyMessageID
+                        )
+
+                        // ✅ hard DB dedupe (persists forever)
+                        val existingId = messageDao.getExistingIdByFingerprint(contactName, fp)
+                        if (existingId != null) {
+                            Log.d(TAG, "⏭️ SKIP (DB duplicate) [$assetType] existingId=$existingId fp=$fp")
+                            detected.node.recycle()
+                            return@forEach
+                        }
                     val message = Message(
                         id = 0,
                         contactName = contactName,
@@ -783,7 +848,8 @@ private suspend fun captureNewMessages() {
                         isSentByUser = isSentByUser,
                         assetType = assetType,
                         replyMessage = replyMessage,
-                        replyMessageID = replyMessageID
+                        replyMessageID = replyMessageID,
+                        fingerprint = fp
                     )
 
                     if (ULTRA_DEEP_LOGGING) {
@@ -794,6 +860,7 @@ private suspend fun captureNewMessages() {
                         Log.d(TAG, "    isSentByUser: $isSentByUser")
                         Log.d(TAG, "    replyMessage: ${replyMessage ?: "null"}")
                         Log.d(TAG, "    replyMessageID: ${replyMessageID ?: "null"}")
+                        Log.d(TAG, "    fingerprint: $fp")
                     }
 
                     val messageId = messageDao.insert(message)
@@ -1371,7 +1438,6 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
             "media_flat",        // Photos and videos
             "media_container",   // Photos and videos (FrameLayout container with content desc)
             "message_content_voice_playback_timer",   // Voice messages (TextView with this specific ID)
-             "gift"
         )
 
         // ViewIDs to EXCLUDE (not messages)
@@ -1442,6 +1508,7 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                                 )
                                 Log.d(TAG, "🎁 GIFT DETECTED: '$giftDesc' at pos(${bounds.left},${bounds.top})")
                             }
+                             return
                         }
 
             // EXCLUDE nodes with specific ViewIDs (timestamps, status, etc.)
@@ -1520,71 +1587,42 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                 }
             }
 
-            if (isMediaNode && contentDesc.isNotBlank()) {
-                val contentDescLower = contentDesc.lowercase()
+            if (isMediaNode && (contentDesc.isNotBlank() || viewIdShort.equals("animated_image", ignoreCase = true))) {
 
-                // EXCLUDE UI elements based on content description
-                val isExcludedContent = excludedContentDesc.any { excluded ->
-                    contentDescLower.contains(excluded)
-                }
+    // If animated_image has no desc, treat it as GIF (or STICKER if your UI indicates sticker)
+    val contentDescLower = contentDesc.lowercase()
+    val assetType = when {
+        viewIdShort.equals("animated_image", ignoreCase = true) && contentDesc.isBlank() -> AssetType.GIF
+        contentDescLower.contains("sent a sticker") || contentDescLower.startsWith("sticker") -> AssetType.STICKER
+        contentDescLower.contains("sent a gif") -> AssetType.GIF
+        contentDescLower.contains("sent a video") || contentDescLower.contains("sent a reel") -> AssetType.VIDEO
+        contentDescLower.contains("sent a voice") || contentDescLower.contains("voice message") -> AssetType.VOICE_NOTE
+        contentDescLower.contains("sent a photo") || contentDescLower.contains("sent a image") || contentDescLower.contains("sent an image") -> AssetType.IMAGE
+        else -> null
+    }
 
-                if (isExcludedContent) {
-                    Log.d(TAG, "⊘ EXCLUDED (UI element): '$contentDesc'")
-                } else {
-                    // Detect specific media types from content description
-                    // Based on Instagram's format: "username sent a [type]" or "Sticker gif..."
-                    // Order matters - check more specific patterns first
-                    val assetType = when {
-                        // Sticker - "sent a sticker" or starts with "Sticker"
-                        contentDescLower.contains("sent a sticker") ||
-                        contentDescLower.startsWith("sticker") -> AssetType.STICKER
+    if (assetType != null) {
+        val bounds = android.graphics.Rect()
+        node.getBoundsInScreen(bounds)
+        val mediaId = "$assetType-${bounds.top}-${bounds.left}"
+        if (!processedMediaIds.contains(mediaId)) {
+            processedMediaIds.add(mediaId)
+            val quotedMessageText = findQuotedMessageInBubble(node)
 
-                        // GIF - "sent a GIF"
-                        contentDescLower.contains("sent a gif") -> AssetType.GIF
-
-                        // Video - "sent a video" or "sent a reel"
-                        contentDescLower.contains("sent a video") ||
-                        contentDescLower.contains("sent a reel") -> AssetType.VIDEO
-
-                        // Voice message - "sent a voice message"
-                        contentDescLower.contains("sent a voice") ||
-                        contentDescLower.contains("voice message") -> AssetType.VOICE_NOTE
-
-                        // Photo/Image - "sent a photo" (most common)
-                        contentDescLower.contains("sent a photo") ||
-                        contentDescLower.contains("sent a image") ||
-                        contentDescLower.contains("sent an image") -> AssetType.IMAGE
-
-                        // If none of the above, log it and skip
-                        else -> {
-                            Log.d(TAG, "❓ UNKNOWN MEDIA: desc='$contentDesc' | viewId='$viewIdShort'")
-                            null
-                        }
-                    }
-
-                    if (assetType != null) {
-                        // Get screen position to make each media unique within this scan
-                        // (different photos have different positions, prevents duplicate detection in same scan)
-                        val bounds = android.graphics.Rect()
-                        node.getBoundsInScreen(bounds)
-                        // Create unique identifier using position for in-memory tracking
-                        val mediaId = "$assetType-${bounds.top}-${bounds.left}"
-                        if (!processedMediaIds.contains(mediaId)) {
-                            processedMediaIds.add(mediaId)
-                            // Check for quoted message in bubble
-                            val quotedMessageText = findQuotedMessageInBubble(node)
-                            // Don't store position - just use content desc for logging
-                            messages.add(DetectedMessage(
-                                text = contentDesc,
-                                assetType = assetType,
-                                node = AccessibilityNodeInfo.obtain(node),
-                                quotedMessageText = quotedMessageText
-                            ))
-                            Log.d(TAG, "✓ DETECTED [$assetType]: '$contentDesc' at pos(${bounds.left},${bounds.top})${if (quotedMessageText != null) " (reply to: '$quotedMessageText')" else ""}")
-                        }
-                    }
-                }
-            }
+            // if no desc, store a small placeholder for logging/dedup signature
+            val descForKey = if (contentDesc.isNotBlank()) contentDesc else "animated_image"
+            messages.add(
+                DetectedMessage(
+                    text = descForKey,
+                    assetType = assetType,
+                    node = AccessibilityNodeInfo.obtain(node),
+                    quotedMessageText = quotedMessageText
+                )
+            )
+            Log.d(TAG, "✓ DETECTED [$assetType]: '$descForKey' at pos(${bounds.left},${bounds.top})")
+        }
+    }
+}
 
             // Check for TEXT messages
             if (node.text != null && node.text.isNotEmpty()) {
