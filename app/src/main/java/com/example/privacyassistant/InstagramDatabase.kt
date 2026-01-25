@@ -84,9 +84,6 @@ interface MessageDao {
     @Query("SELECT id FROM messages WHERE contactName = :contactName AND fingerprint = :fingerprint LIMIT 1")
     suspend fun getExistingIdByFingerprint(contactName: String, fingerprint: String): Long?
 
-    @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText AND replyToMessageText = :replyToMessageText LIMIT 1")
-    suspend fun findDuplicateMessageWithReply(contactName: String, messageText: String?, replyToMessageText: String?): Message?
-    
     @Query("SELECT * FROM messages WHERE id = :messageId LIMIT 1")
     suspend fun getMessageById(messageId: Long): Message?
 

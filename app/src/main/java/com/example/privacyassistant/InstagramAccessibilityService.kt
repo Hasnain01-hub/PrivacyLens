@@ -624,7 +624,6 @@ private fun buildFingerprint(
 ): String {
     val base = when (assetType) {
         AssetType.TEXT -> "t|$isSentByUser|${messageText.orEmpty().trim()}"
-        AssetType.GIFT -> "g|$isSentByUser" // gifts have null text by your rule
         else -> {
             // media fingerprint should NOT use bounds (bounds change when you reopen/scroll)
             val d = normalizeDesc(detectedDesc.orEmpty())
@@ -685,9 +684,9 @@ private suspend fun captureNewMessages() {
 
                 // For text messages: store the actual text in messageText
                 // For media messages: store EMPTY string in messageText (user requirement)
-                val messageText: String? = when (assetType) {
+                val messageText = when (assetType) {
                         AssetType.TEXT -> detected.text
-                        AssetType.GIFT -> null              // <-- gift must be null
+
                         else -> ""                          // other media stays empty
                     }
 
@@ -895,7 +894,6 @@ if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPL
                 // Recycle the node after use
                 detected.node.recycle()
             }
-        }
 
         rootNode.recycle()
     } catch (e: Exception) {
