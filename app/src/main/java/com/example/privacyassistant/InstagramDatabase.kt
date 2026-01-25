@@ -26,7 +26,12 @@ object AssetType {
     const val GIFT = "gift" 
 }
 
-@Entity(tableName = "messages")
+@Entity(
+    tableName = "messages",
+    indices = [
+        Index(value = ["contactName", "fingerprint"], unique = true)
+    ]
+)
 data class Message(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val contactName: String,
@@ -35,7 +40,8 @@ data class Message(
     val isSentByUser: Boolean = false,
     val assetType: String = AssetType.TEXT,  // text, image, video, gif, sticker, voice_note
     val replyMessage: String? = null,  // The text of the message being replied to
-    val replyMessageID: Long? = null   // The database ID of the message being replied to
+    val replyMessageID: Long? = null,   // The database ID of the message being replied to
+     val fingerprint: String
 )
 
 @Dao
@@ -74,6 +80,9 @@ data class ContactWithReadableTime(
 interface MessageDao {
     @Insert
     suspend fun insert(message: Message): Long
+
+    @Query("SELECT id FROM messages WHERE contactName = :contactName AND fingerprint = :fingerprint LIMIT 1")
+    suspend fun getExistingIdByFingerprint(contactName: String, fingerprint: String): Long?
 
     @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText AND replyToMessageText = :replyToMessageText LIMIT 1")
     suspend fun findDuplicateMessageWithReply(contactName: String, messageText: String?, replyToMessageText: String?): Message?
