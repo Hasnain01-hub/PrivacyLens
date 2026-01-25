@@ -32,6 +32,7 @@ class InstagramAccessibilityService : AccessibilityService() {
     companion object {
         const val TAG = "InstagramAccessibility"
         const val INSTAGRAM_PACKAGE = "com.instagram.android"
+        const val ULTRA_DEEP_LOGGING = true // Set to false to reduce log noise
         private var instance: InstagramAccessibilityService? = null
         fun getInstance(): InstagramAccessibilityService? = instance
     }
@@ -44,7 +45,44 @@ class InstagramAccessibilityService : AccessibilityService() {
 
     private var isInDirectMessages = false
     private var currentChatContact: String? = null
-    private val processedMessages = mutableSetOf<String>()
+
+    // Text message deduplication: track text with timestamps
+    // Key: "contactName-text-isSentByUser", Value: timestamp
+    private val textMessageCache = mutableMapOf<String, Long>()
+
+    // Media deduplication: track content descriptions with timestamps
+    // Key: "contactName-assetType-contentDescription", Value: timestamp
+    private val mediaContentCache = mutableMapOf<String, Long>()
+
+    // Time windows for deduplication
+    private val SENT_MESSAGE_DUPLICATE_WINDOW_MS = 60000L // 60 seconds for sent messages (longer because they stay visible and get rescanned)
+    private val RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS = 300000L // 5 minutes for received messages (prevents re-saving when scrolling or returning to chat)
+
+    // Store reply context between scans with timestamp
+    // Triple: (replyText, replyMessageID, timestamp when stored)
+    private var pendingReplyContext: Triple<String, Long, Long>? = null
+    private val REPLY_CONTEXT_TIMEOUT_MS = 60000L // Keep reply context for 60 seconds to allow multiple replies in sequence
+
+    // Track recent messages for position-based reply inference
+    // List of (messageText, messageID, timestamp, yPosition, isSentByUser)
+    private val recentMessagesForReplyInference = mutableListOf<RecentMessageInfo>()
+    private val REPLY_INFERENCE_WINDOW_MS = 15000L // 15 seconds window for inferring replies
+
+    data class RecentMessageInfo(
+        val messageText: String,
+        val messageId: Long,
+        val timestamp: Long,
+        val yPosition: Int,
+        val isSentByUser: Boolean
+    )
+
+    // Data class to hold detected message info
+    data class DetectedMessage(
+        val text: String,
+        val assetType: String,
+        val node: AccessibilityNodeInfo,
+        val quotedMessageText: String? = null  // For received messages that are replies
+    )
 
     private var lastMessageCaptureTime = 0L
     private var lastContactCaptureTime = 0L
@@ -342,7 +380,10 @@ private fun findReplyTextInNode(node: AccessibilityNodeInfo): String? {
             if (isInDirectMessages) {
                 isInDirectMessages = false
                 currentChatContact = null
-                processedMessages.clear()
+                textMessageCache.clear()
+                mediaContentCache.clear()
+                pendingReplyContext = null
+                recentMessagesForReplyInference.clear()
             }
         }
     }
@@ -497,12 +538,9 @@ fun exportDataToFile() {
                     out.println("\n[$contactName] - ${msgs.size} messages")
                     msgs.forEach { msg ->
                         val direction = if (msg.isSentByUser) "SENT" else "RECEIVED"
-                        val giftIndicator = if (msg.isGift == 1) " [GIFT]" else ""
-                        val replyInfo = if (msg.replyToMessageText != null) 
-                            " (↩️ Reply to: \"${msg.replyToMessageText}\")" else ""
-                        val messageContent = msg.messageText ?: "[Gift/Media]"
-                        
-                        out.println("  [${msg.readableTime}] [$direction]$giftIndicator $messageContent$replyInfo")
+                        val assetLabel = msg.assetType.uppercase()
+                        val content = if (msg.assetType == AssetType.TEXT) msg.messageText else "[${msg.assetType}]"
+                        out.println("  [${msg.readableTime}] [$direction] [$assetLabel] $content")
                     }
                 }
             }
@@ -516,12 +554,34 @@ fun exportDataToFile() {
 
     private fun detectChatOpen() {
         ioScope.launch {
-            delay(500)
+            delay(500) // Wait a bit for chat to load
+
+            // Only detect chat contact if we're actually in a chat (not the inbox)
+            // This prevents capturing the user's own username from the inbox header
+            if (isInInboxView()) {
+                // Log.d(TAG, "In inbox view, skipping chat contact detection")
+                currentChatContact = null
+                return@launch
+            }
+
             val contactName = findCurrentChatContact()
+            Log.d(TAG, "🔍 CHAT CONTACT DETECTION: found='$contactName' current='$currentChatContact'")
             if (contactName != null && contactName != currentChatContact) {
+                Log.d(TAG, "📱 OPENED CHAT WITH: '$contactName'")
                 currentChatContact = contactName
-                processedMessages.clear()
+                // Clear caches for this new chat
+                textMessageCache.clear()
+                mediaContentCache.clear()
+                pendingReplyContext = null
+                recentMessagesForReplyInference.clear()
+
+                // Save contact if not already saved
                 saveContact(contactName)
+
+                // Auto-capture messages after chat loads
+                delay(800) // Wait a bit longer for messages to load
+                captureNewMessages()
+                Log.d(TAG, "📨 Auto-captured messages on chat open")
             }
         }
     }
@@ -547,49 +607,226 @@ private suspend fun captureNewMessages() {
         val rootNode = rootInActiveWindow ?: return
         val contactName = currentChatContact ?: "Unknown"
 
-        val messages = findMessageNodes(rootNode)
-        var newMessageCount = 0
+            // Detect and store reply context if present
+            detectAndStoreReplyContext(rootNode, contactName)
 
-        messages.forEach { messageNode ->
-            val messageData = extractMessageData(messageNode)
-            
-            if (messageData.isValid()) {
-                val messageHash = "$contactName-${messageData.messageText}-${messageData.replyToText}"
-                val existsInMemory = processedMessages.contains(messageHash)
-                
-                // Check for duplicate with reply context
-                val existsInDb = if (messageData.replyToText != null) {
-                    messageDao.findDuplicateMessageWithReply(
-                        contactName, 
-                        messageData.messageText, 
-                        messageData.replyToText
-                    ) != null
+            // Find all message nodes (text and media)
+            val detectedMessages = findMessageNodes(rootNode)
+            var newMessageCount = 0
+
+            if (ULTRA_DEEP_LOGGING) {
+                Log.d(TAG, "╔════════════════════════════════════════════╗")
+                Log.d(TAG, "║ SCAN SUMMARY                               ║")
+                Log.d(TAG, "╚════════════════════════════════════════════╝")
+                Log.d(TAG, "  Contact: $contactName")
+                Log.d(TAG, "  Detected messages: ${detectedMessages.size}")
+                detectedMessages.forEachIndexed { index, msg ->
+                    Log.d(TAG, "    ${index + 1}. [${ msg.assetType}] '${msg.text.take(30)}'")
+                }
+            }
+
+            // DEBUG: If no messages found, dump UI tree to help troubleshoot
+            // if (detectedMessages.isEmpty()) {
+            //     Log.w(TAG, "⚠️ No messages found in UI tree. Dumping UI structure for debugging...")
+            //     dumpUITree(rootNode, maxDepth = 8)
+            // }
+
+            val currentTime = System.currentTimeMillis()
+
+            // Clean up old entries from caches (keep only last 60 seconds)
+            val cacheCleanupThreshold = currentTime - 60000L
+            textMessageCache.entries.removeIf { it.value < cacheCleanupThreshold }
+            mediaContentCache.entries.removeIf { it.value < cacheCleanupThreshold }
+
+            // Process each detected message
+            detectedMessages.forEach { detected ->
+                val assetType = detected.assetType
+
+                // Determine if message is sent by user (needed for deduplication and storage)
+                val isSentByUser = isMessageSentByUser(detected.node)
+
+                // For text messages: store the actual text in messageText
+                // For media messages: store EMPTY string in messageText (user requirement)
+                val messageText = if (assetType == AssetType.TEXT) {
+                    detected.text
                 } else {
-                    messageDao.findDuplicateMessage(contactName, messageData.messageText ?: "") != null
+                    "" // Empty for all media types
                 }
 
-                if (!existsInMemory && !existsInDb) {
-                    processedMessages.add(messageHash)
+                if (assetType == AssetType.TEXT && detected.text.isBlank()) {
+                    // Skip blank text messages
+                    detected.node.recycle()
+                    return@forEach
+                }
 
-                    val isSentByUser = isMessageSentByUser(messageNode)
+                var shouldSave = false
+                val direction = if (isSentByUser) "SENT" else "RECEIVED"
+
+                if (ULTRA_DEEP_LOGGING) {
+                    Log.d(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                    Log.d(TAG, "🔍 PROCESSING MESSAGE:")
+                    Log.d(TAG, "  Text: '${detected.text.take(50)}'")
+                    Log.d(TAG, "  Type: $assetType")
+                    Log.d(TAG, "  Direction: $direction")
+                }
+
+                if (assetType == AssetType.TEXT) {
+                    // For text: use time-based deduplication
+                    // IMPORTANT: Include isSentByUser to distinguish between:
+                    // - "Hi" sent by friend
+                    // - "Hi" sent by user
+                    // Use longer window for RECEIVED messages (they shouldn't duplicate)
+                    // Use shorter window for SENT messages (you might send same text again)
+                    val textKey = "$contactName-${detected.text}-$isSentByUser"
+                    val lastSeenTime = textMessageCache[textKey]
+                    val duplicateWindow = if (isSentByUser) {
+                        SENT_MESSAGE_DUPLICATE_WINDOW_MS
+                    } else {
+                        RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS
+                    }
+
+                    if (ULTRA_DEEP_LOGGING) {
+                        Log.d(TAG, "  Deduplication key: '$textKey'")
+                        Log.d(TAG, "  Last seen: ${if (lastSeenTime != null) "${currentTime - lastSeenTime}ms ago" else "never"}")
+                        Log.d(TAG, "  Window: ${duplicateWindow}ms (${if (isSentByUser) "SENT" else "RECEIVED"})")
+                    }
+
+                    if (lastSeenTime == null || (currentTime - lastSeenTime) > duplicateWindow) {
+                        // Either never seen before, or seen long ago → safe to save
+                        shouldSave = true
+                        textMessageCache[textKey] = currentTime
+                        if (ULTRA_DEEP_LOGGING) {
+                            Log.d(TAG, "  ✅ DECISION: SAVE (${if (lastSeenTime == null) "first time" else "outside window"})")
+                        }
+                    } else {
+                        // Seen recently → likely scroll duplicate, skip
+                        Log.d(TAG, "  ⏭️ DECISION: SKIP - seen ${currentTime - lastSeenTime}ms ago (within ${duplicateWindow}ms window)")
+                    }
+                } else {
+                    // For media: use content description to uniquely identify each media item
+                    // This allows us to:
+                    // - Skip the SAME media when detected again due to scrolling
+                    // - Save DIFFERENT media even if sent close together
+                    val contentDescription = detected.text // This contains the content description for media
+                    val mediaKey = "$contactName-$assetType-$contentDescription"
+
+                    val lastSeenTime = mediaContentCache[mediaKey]
+
+                    if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS) {
+                        // Either never seen before, or seen long ago → safe to save
+                        shouldSave = true
+                        mediaContentCache[mediaKey] = currentTime
+                    } else {
+                        // Seen recently → likely scroll duplicate, skip
+                        Log.d(TAG, "⏭️ SKIP [$assetType] - seen ${currentTime - lastSeenTime}ms ago: '$contentDescription'")
+                    }
+                }
+
+                if (shouldSave) {
                     val timestamp = System.currentTimeMillis()
+
+                    // Get Y position of this message for reply inference
+                    val bounds = android.graphics.Rect()
+                    detected.node.getBoundsInScreen(bounds)
+                    val messageYPosition = bounds.top
+
+                    // Determine reply context based on message direction
+                    var replyMessage: String? = null
+                    var replyMessageID: Long? = null
+
+                    if (isSentByUser) {
+                        // For SENT messages: use the global reply context from compose area
+                        if (pendingReplyContext != null) {
+                            replyMessage = pendingReplyContext!!.first
+                            replyMessageID = pendingReplyContext!!.second
+                            Log.d(TAG, "  💬 APPLYING REPLY CONTEXT (SENT): '$replyMessage' (ID: $replyMessageID)")
+                            // DON'T clear the context after using it - allow multiple messages to reply to the same message
+                            // Context will expire naturally after REPLY_CONTEXT_TIMEOUT_MS (60s)
+                        } else if (ULTRA_DEEP_LOGGING) {
+                            Log.d(TAG, "  ℹ️ No pending reply context")
+                        }
+                    } else {
+                        // For RECEIVED messages: try multiple methods to detect replies
+
+                        // Method 1: Check if the message bubble contained a quoted message (Instagram's native reply UI)
+                        if (detected.quotedMessageText != null) {
+                            if (ULTRA_DEEP_LOGGING) {
+                                Log.d(TAG, "  🔍 RECEIVED message has quoted text: '${detected.quotedMessageText}'")
+                            }
+                            // Look up the original message in database
+                            val originalMessage = messageDao.findMessageByText(contactName, detected.quotedMessageText)
+                            if (originalMessage != null) {
+                                replyMessage = detected.quotedMessageText
+                                replyMessageID = originalMessage.id
+                                Log.d(TAG, "  💬 APPLYING REPLY CONTEXT (RECEIVED - Native UI): '$replyMessage' (ID: $replyMessageID)")
+                            } else if (ULTRA_DEEP_LOGGING) {
+                                Log.d(TAG, "  ⚠️ Quoted message not found in DB: '${detected.quotedMessageText}'")
+                            }
+                        }
+
+                        // Method 2: If no quoted text found, try position-based inference
+                        if (replyMessage == null) {
+                            val inferredReply = inferReplyFromPosition(messageYPosition, timestamp, contactName)
+                            if (inferredReply != null) {
+                                replyMessage = inferredReply.first
+                                replyMessageID = inferredReply.second
+                                Log.d(TAG, "  💬 APPLYING REPLY CONTEXT (RECEIVED - Position Inference): '$replyMessage' (ID: $replyMessageID)")
+                            }
+                        }
+                    }
 
                     val message = Message(
                         id = 0,
                         contactName = contactName,
-                        messageText = messageData.messageText,
+                        messageText = messageText,  // Empty for media, actual text for text messages
                         timestamp = timestamp,
                         isSentByUser = isSentByUser,
-                        isGift = messageData.isGift,
-                        replyToMessageId = null, // Could be linked later if needed
-                        replyToMessageText = messageData.replyToText
+                        assetType = assetType,
+                        replyMessage = replyMessage,
+                        replyMessageID = replyMessageID
                     )
 
-                    messageDao.insert(message)
+                    if (ULTRA_DEEP_LOGGING) {
+                        Log.d(TAG, "  💾 SAVING TO DATABASE:")
+                        Log.d(TAG, "    contactName: $contactName")
+                        Log.d(TAG, "    messageText: '${messageText.take(50)}'")
+                        Log.d(TAG, "    assetType: $assetType")
+                        Log.d(TAG, "    isSentByUser: $isSentByUser")
+                        Log.d(TAG, "    replyMessage: ${replyMessage ?: "null"}")
+                        Log.d(TAG, "    replyMessageID: ${replyMessageID ?: "null"}")
+                    }
+
+                    val messageId = messageDao.insert(message)
                     newMessageCount++
-                    
-                    Log.d(TAG, "Captured message: ${if (messageData.isGift == 1) "[GIFT]" else messageData.messageText}${if (messageData.replyToText != null) " (reply to: ${messageData.replyToText})" else ""}")
+
+                    val preview = if (assetType == AssetType.TEXT) messageText.take(50) else detected.text.take(50)
+                    val replyInfo = if (replyMessageID != null) " [REPLY TO: $replyMessageID]" else ""
+                    Log.d(TAG, "  ✅ SAVED [$assetType] [$direction]: '$preview' (DB ID: $messageId)$replyInfo")
+
+                    // Store this message for position-based reply inference
+                    // Only store text messages (media messages don't typically get replied to by text)
+                    if (assetType == AssetType.TEXT && messageText.isNotBlank()) {
+                        recentMessagesForReplyInference.add(
+                            RecentMessageInfo(
+                                messageText = messageText,
+                                messageId = messageId,
+                                timestamp = timestamp,
+                                yPosition = messageYPosition,
+                                isSentByUser = isSentByUser
+                            )
+                        )
+                        if (ULTRA_DEEP_LOGGING) {
+                            Log.d(TAG, "  📌 Stored for reply inference: Y=$messageYPosition, sent=$isSentByUser")
+                        }
+                    }
+
+                    if (ULTRA_DEEP_LOGGING) {
+                        Log.d(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                    }
                 }
+
+                // Recycle the node after use
+                detected.node.recycle()
             }
         }
 
@@ -636,6 +873,7 @@ private suspend fun captureNewMessages() {
                     timestamp = System.currentTimeMillis()
                 )
                 contactDao.insert(contact)
+                Log.d(TAG, "👤 SAVED NEW CONTACT: '$contactName'")
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error saving contact: ${e.message}")
@@ -732,24 +970,32 @@ private suspend fun captureNewMessages() {
         val rootNode = rootInActiveWindow ?: return null
 
         var contactName: String? = null
-
+        
+        // Updated patterns for chat header - ONLY specific chat header titles
         val headerPatterns = listOf(
-            "title",
-            "action_bar_title",
-            "thread_title",
-            "header_title",
-            "toolbar_title",
+            "header_title",           // Contact name in chat header
+            "thread_title",           // Thread title
             "direct_thread_header_title"
         )
 
+        // ViewIDs to EXCLUDE (these show the logged-in user's name, not contact)
+        val excludedHeaderPatterns = listOf(
+            "igds_action_bar_title",  // This shows YOUR username, not the contact
+            "action_bar_title"        // General action bar (can show your username)
+        )
+        
         fun searchForContact(node: AccessibilityNodeInfo, depth: Int = 0) {
             if (contactName != null) return
 
             if (node.text != null && node.text.isNotEmpty()) {
                 val text = node.text.toString().trim()
                 val viewId = node.viewIdResourceName ?: ""
-
-                val isHeader = headerPatterns.any { pattern ->
+                
+                // Check header patterns but EXCLUDE patterns that show logged-in user
+                val isExcludedHeader = excludedHeaderPatterns.any { pattern ->
+                    viewId.contains(pattern, ignoreCase = true)
+                }
+                val isHeader = !isExcludedHeader && headerPatterns.any { pattern ->
                     viewId.contains(pattern, ignoreCase = true)
                 }
 
@@ -762,20 +1008,29 @@ private suspend fun captureNewMessages() {
                     !text.contains("Active", ignoreCase = true) &&
                     !text.contains("Online", ignoreCase = true) &&
                     !text.contains("ago", ignoreCase = true) &&
-                    !text.contains("For you", ignoreCase = true) &&
-                    !text.contains("Chats", ignoreCase = true) &&
-                    !text.contains("Channels", ignoreCase = true) &&
-                    !text.contains("Notes", ignoreCase = true) &&
-                    !text.contains("Groups", ignoreCase = true) &&
-                    !text.contains("Messages", ignoreCase = true) &&
-                    !text.contains("Direct", ignoreCase = true) &&
-                    !text.contains("Instagram", ignoreCase = true) &&
-                    !text.contains("Search", ignoreCase = true) &&
+                    !text.contains("For you", ignoreCase = true) &&  // Instagram tabs
+                    !text.contains("Chats", ignoreCase = true) &&     // Tab label
+                    !text.contains("Channels", ignoreCase = true) &&  // Tab label
+                    !text.contains("Notes", ignoreCase = true) &&     // Tab label
+                    !text.contains("Groups", ignoreCase = true) &&    // Tab label
+                    !text.contains("Messages", ignoreCase = true) &&  // Tab label
+                    !text.contains("Direct", ignoreCase = true) &&    // Tab label
+                    !text.contains("Instagram", ignoreCase = true) && // App name
+                    !text.contains("Search", ignoreCase = true) &&    // Search UI
+                    !text.contains("Create", ignoreCase = true) &&    // UI buttons like "Create your avatar"
+                    !text.contains("Avatar", ignoreCase = true) &&    // Avatar UI
+                    !text.contains("Sticker", ignoreCase = true) &&   // Sticker UI
+                    !text.contains("GIF", ignoreCase = true) &&       // GIF picker
+                    !text.contains("Photo", ignoreCase = true) &&     // Photo picker
+                    !text.contains("Gallery", ignoreCase = true) &&   // Gallery UI
                     !text.all { it.isDigit() }
 
                 if (isHeader && isValidContactName) {
                     contactName = text
+                    Log.d(TAG, "✓ HEADER CONTACT: '$text' (viewId: ${viewId.substringAfterLast(':')})")
                     return
+                } else if (isHeader && !isValidContactName) {
+                    Log.d(TAG, "⊘ REJECTED HEADER: '$text' (viewId: ${viewId.substringAfterLast(':')})")
                 }
             }
 
@@ -796,43 +1051,483 @@ private suspend fun captureNewMessages() {
     }
 }
 
-    private fun findMessageNodes(rootNode: AccessibilityNodeInfo): List<AccessibilityNodeInfo> {
-        val messages = mutableListOf<AccessibilityNodeInfo>()
+    /**
+     * Detects if user is replying to a message by checking for the reply bar.
+     * Looks up the original message in the database and stores the reply context.
+     */
+    private suspend fun detectAndStoreReplyContext(rootNode: AccessibilityNodeInfo, contactName: String) {
+        var quotedMessageText: String? = null
 
+        fun searchForQuotedMessage(node: AccessibilityNodeInfo) {
+            val viewId = node.viewIdResourceName ?: ""
+            val viewIdShort = viewId.substringAfterLast('/')?.substringAfterLast(':') ?: ""
+
+            // Look for the quoted_message_subtitle which contains the replied-to message text
+            if (viewIdShort.equals("quoted_message_subtitle", ignoreCase = true)) {
+                val text = node.text?.toString()
+                if (!text.isNullOrBlank()) {
+                    quotedMessageText = text
+                    return  // Found it, stop searching
+                }
+            }
+
+            // Recursively search children
+            for (i in 0 until node.childCount) {
+                if (quotedMessageText != null) return  // Already found, stop
+                node.getChild(i)?.let { child ->
+                    searchForQuotedMessage(child)
+                    child.recycle()
+                }
+            }
+        }
+
+        searchForQuotedMessage(rootNode)
+
+        val currentTime = System.currentTimeMillis()
+
+        if (ULTRA_DEEP_LOGGING) {
+            Log.d(TAG, "╔════════════════════════════════════════════╗")
+            Log.d(TAG, "║ REPLY CONTEXT DETECTION                    ║")
+            Log.d(TAG, "╚════════════════════════════════════════════╝")
+            Log.d(TAG, "  Quoted message found: ${quotedMessageText ?: "none"}")
+            Log.d(TAG, "  Current pending context: ${pendingReplyContext?.let { "'${it.first}' (ID: ${it.second}, age: ${currentTime - it.third}ms)" } ?: "none"}")
+        }
+
+        // If reply bar found, look up the original message and store context with timestamp
+        if (!quotedMessageText.isNullOrBlank()) {
+            val originalMessage = messageDao.findMessageByText(contactName, quotedMessageText)
+            if (ULTRA_DEEP_LOGGING) {
+                Log.d(TAG, "  DB lookup for '$quotedMessageText': ${if (originalMessage != null) "FOUND (ID: ${originalMessage.id})" else "NOT FOUND"}")
+            }
+
+            if (originalMessage != null) {
+                // Only update if we don't already have this context
+                if (pendingReplyContext == null || pendingReplyContext!!.first != quotedMessageText) {
+                    pendingReplyContext = Triple(quotedMessageText, originalMessage.id, currentTime)
+                    Log.d(TAG, "  🔄 REPLY CONTEXT STORED: '$quotedMessageText' (ID: ${originalMessage.id})")
+                } else if (ULTRA_DEEP_LOGGING) {
+                    Log.d(TAG, "  ℹ️ Context unchanged (already stored)")
+                }
+            } else {
+                Log.w(TAG, "  ⚠️ Reply bar detected but original message not found in DB: '$quotedMessageText'")
+            }
+        } else {
+            // No reply bar visible - check if existing context has timed out
+            pendingReplyContext?.let { context ->
+                val age = currentTime - context.third
+                if (ULTRA_DEEP_LOGGING) {
+                    Log.d(TAG, "  No reply bar visible, context age: ${age}ms (timeout: ${REPLY_CONTEXT_TIMEOUT_MS}ms)")
+                }
+                if (age > REPLY_CONTEXT_TIMEOUT_MS) {
+                    Log.d(TAG, "  ⏱️ Reply context EXPIRED (${age}ms old)")
+                    pendingReplyContext = null
+                } else if (ULTRA_DEEP_LOGGING) {
+                    Log.d(TAG, "  ✓ Context preserved (still within timeout)")
+                }
+                // Don't clear if still within timeout - message might still be detected
+            }
+        }
+    }
+
+    /**
+     * Infers reply context for RECEIVED messages based on position heuristics.
+     * If a RECEIVED message appears shortly after and BELOW a SENT message,
+     * it's likely a reply to that message.
+     */
+    private fun inferReplyFromPosition(messageYPosition: Int, messageTimestamp: Long, contactName: String): Pair<String, Long>? {
+        // Clean up old entries (older than inference window)
+        val cutoffTime = messageTimestamp - REPLY_INFERENCE_WINDOW_MS
+        recentMessagesForReplyInference.removeAll { it.timestamp < cutoffTime }
+
+        // Find recent SENT messages (by user) that are ABOVE this received message
+        val candidateMessages = recentMessagesForReplyInference
+            .filter { it.isSentByUser } // Only look at user's messages
+            .filter { it.yPosition < messageYPosition } // Must be ABOVE (smaller Y)
+            .filter { messageTimestamp - it.timestamp < REPLY_INFERENCE_WINDOW_MS } // Within time window
+            .sortedByDescending { it.timestamp } // Most recent first
+
+        if (candidateMessages.isNotEmpty()) {
+            val mostRecentAbove = candidateMessages.first()
+            val timeDiff = messageTimestamp - mostRecentAbove.timestamp
+
+            if (ULTRA_DEEP_LOGGING) {
+                Log.d(TAG, "  🔍 POSITION-BASED REPLY INFERENCE:")
+                Log.d(TAG, "    Received message Y: $messageYPosition")
+                Log.d(TAG, "    Found ${candidateMessages.size} candidate(s) above")
+                Log.d(TAG, "    Best candidate: '${mostRecentAbove.messageText}' (Y: ${mostRecentAbove.yPosition}, ${timeDiff}ms ago)")
+            }
+
+            // If the time difference is reasonable (not too long), infer it's a reply
+            if (timeDiff < REPLY_INFERENCE_WINDOW_MS) {
+                Log.d(TAG, "  💡 INFERRED REPLY: This received message is likely replying to '${mostRecentAbove.messageText}'")
+                return Pair(mostRecentAbove.messageText, mostRecentAbove.messageId)
+            }
+        } else if (ULTRA_DEEP_LOGGING) {
+            Log.d(TAG, "  ℹ️ No recent SENT messages found above this RECEIVED message for reply inference")
+        }
+
+        return null
+    }
+
+    /**
+     * Dumps the UI hierarchy of a node for debugging (non-recursive, compact format)
+     */
+    private fun dumpNodeHierarchy(node: AccessibilityNodeInfo, prefix: String = "", maxDepth: Int = 6) {
+        if (maxDepth <= 0) return
+
+        var current: AccessibilityNodeInfo? = node
+        var depth = 0
+        val hierarchy = mutableListOf<String>()
+
+        // Walk up ancestors
+        while (current != null && depth < 6) {
+            val viewId = current.viewIdResourceName ?: ""
+            val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
+            val text = current.text?.toString() ?: ""
+            val className = current.className?.toString()?.substringAfterLast('.') ?: ""
+
+            val info = buildString {
+                append(className)
+                if (viewIdShort.isNotBlank()) append("[$viewIdShort]")
+                if (text.isNotBlank() && text.length <= 20) append("='$text'")
+            }
+
+            if (info.isNotBlank()) {
+                hierarchy.add(0, info) // Add to beginning to show from root to leaf
+            }
+
+            current = current.parent
+            depth++
+        }
+
+        Log.d(TAG, "$prefix ${hierarchy.joinToString(" > ")}")
+
+        // Also dump direct children
+        for (i in 0 until node.childCount) {
+            node.getChild(i)?.let { child ->
+                val viewId = child.viewIdResourceName ?: ""
+                val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
+                val text = child.text?.toString() ?: ""
+                val className = child.className?.toString()?.substringAfterLast('.') ?: ""
+
+                if (viewIdShort.isNotBlank() || text.isNotBlank()) {
+                    Log.d(TAG, "  $prefix   CHILD[$i]: $className[$viewIdShort] text='${text.take(30)}'")
+                }
+                child.recycle()
+            }
+        }
+    }
+
+    /**
+     * Detects if a message bubble contains a quoted message (for received replies).
+     * Returns the quoted message text if found, null otherwise.
+     */
+    private fun findQuotedMessageInBubble(messageNode: AccessibilityNodeInfo): String? {
+        var quotedText: String? = null
+
+        // Search the message node and its siblings/ancestors for quoted message indicators
+        var current: AccessibilityNodeInfo? = messageNode.parent
+        var depth = 0
+
+        while (current != null && depth < 8) {
+            // Check this node and its children for quoted message text
+            fun searchForQuoted(node: AccessibilityNodeInfo, searchDepth: Int = 0) {
+                if (quotedText != null || searchDepth > 5) return
+
+                val viewId = node.viewIdResourceName ?: ""
+                val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
+                val text = node.text?.toString() ?: ""
+                val className = node.className?.toString() ?: ""
+
+                // Look for common quoted message viewIds in received message bubbles
+                // These are different from the compose reply bar
+                val isQuotedMessageIndicator = viewIdShort.equals("quoted_message_subtitle", ignoreCase = true) ||
+                                               viewIdShort.equals("message_quoted_content", ignoreCase = true) ||
+                                               viewIdShort.equals("replied_message_text", ignoreCase = true) ||
+                                               viewIdShort.equals("quoted_text", ignoreCase = true) ||
+                                               viewIdShort.equals("message_reply_snippet", ignoreCase = true)
+
+                // Also check for TextView with small text size (quoted messages typically use smaller font)
+                // inside a message bubble but not the main message text
+                if (isQuotedMessageIndicator && text.isNotBlank()) {
+                    quotedText = text
+                    if (ULTRA_DEEP_LOGGING) {
+                        Log.d(TAG, "  🔍 Found quoted message in bubble: '$text' (viewId: $viewIdShort)")
+                    }
+                    return
+                }
+
+                // Recursively search children
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { child ->
+                        searchForQuoted(child, searchDepth + 1)
+                        child.recycle()
+                    }
+                }
+            }
+
+            searchForQuoted(current)
+
+            current = current.parent
+            depth++
+        }
+
+        // If we didn't find anything and ultra deep logging is on, dump the hierarchy for debugging
+        if (quotedText == null && ULTRA_DEEP_LOGGING) {
+            Log.d(TAG, "  ⚠️ NO QUOTED MESSAGE FOUND - Dumping UI hierarchy:")
+            dumpNodeHierarchy(messageNode, "    ")
+        }
+
+        return quotedText
+    }
+
+    /**
+     * Checks if a node is inside the reply bar (quoted message preview).
+     * These should NOT be detected as new messages.
+     */
+    private fun isInsideReplyBar(node: AccessibilityNodeInfo): Boolean {
+        var current: AccessibilityNodeInfo? = node
+        var depth = 0
+        val ancestors = mutableListOf<String>()
+
+        while (current != null && depth < 10) {
+            val viewId = current.viewIdResourceName ?: ""
+            val viewIdShort = viewId.substringAfterLast('/')?.substringAfterLast(':') ?: ""
+
+            if (viewIdShort.isNotBlank()) {
+                ancestors.add(viewIdShort)
+            }
+
+            // Check if this is the reply bar container
+            if (viewIdShort.equals("message_reply_bar", ignoreCase = true) ||
+                viewIdShort.equals("quoted_message_subtitle", ignoreCase = true) ||
+                viewIdShort.equals("quoted_message_info", ignoreCase = true)) {
+                if (ULTRA_DEEP_LOGGING) {
+                    Log.d(TAG, "🚫 NODE IS INSIDE REPLY BAR: Found ancestor '$viewIdShort' at depth $depth")
+                }
+                return true
+            }
+
+            current = current.parent
+            depth++
+        }
+
+        if (ULTRA_DEEP_LOGGING && ancestors.isNotEmpty()) {
+            Log.v(TAG, "  Ancestor chain: ${ancestors.joinToString(" > ")}")
+        }
+        return false
+    }
+
+    private fun findMessageNodes(rootNode: AccessibilityNodeInfo): List<DetectedMessage> {
+        val messages = mutableListOf<DetectedMessage>()
+        val processedMediaIds = mutableSetOf<String>() // Track media to avoid duplicates within same scan
+
+        // Patterns that indicate actual message content nodes (text messages)
         val messageViewIdPatterns = listOf(
             "direct_text_message_text_view",
             "message_content"
         )
 
+        // ONLY these viewIds contain ACTUAL media messages
+        val validMediaViewIds = listOf(
+            "animated_image",    // Stickers and GIFs
+            "media_flat",        // Photos and videos
+            "media_container",   // Photos and videos (FrameLayout container with content desc)
+            "message_content_voice_playback_timer"   // Voice messages (TextView with this specific ID)
+        )
+
+        // ViewIDs to EXCLUDE (not messages)
         val excludedViewIds = listOf(
             "message_status",
             "timestamp",
+            "composer_edittext",  // Message input field
+            "row_thread_composer_edittext",  // Message input field
             "seen_indicator",
             "status",
             "hint",
-            "placeholder"
+            "placeholder",
+            "avatar",  // Profile pictures
+            "profile",
+            "action_bar",  // Header elements
+            "toolbar",
+            "button",  // UI buttons
+            "icon",
+            "row_thread_composer_voice"  // Voice record button (not actual voice message)
+        )
+
+        // Content descriptions to EXCLUDE (UI elements, not media messages)
+        // Use specific phrases to avoid false positives
+        val excludedContentDesc = listOf(
+            "navigate up",       // Back button
+            "more options",
+            "camera",
+            "gallery",
+            "send message",
+            "like message",
+            "liked",
+            "audio call",        // Call button
+            "video call",        // Call button
+            "press and hold"     // Voice record hint
         )
 
         fun searchNodes(node: AccessibilityNodeInfo, depth: Int = 0) {
-            if (node.text != null && node.text.isNotEmpty()) {
-                val text = node.text.toString().trim()
-                val viewId = node.viewIdResourceName ?: ""
-                val className = node.className?.toString() ?: ""
+            val viewId = node.viewIdResourceName ?: ""
+            val className = node.className?.toString() ?: ""
+            val contentDesc = node.contentDescription?.toString() ?: ""
+            val text = node.text?.toString() ?: ""
+            // Extract just the ID name: "com.instagram.android:id/animated_image" -> "animated_image"
+            // or "id/animated_image" -> "animated_image"
+            val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
 
-                val isExcludedViewId = excludedViewIds.any { excluded ->
-                    viewId.contains(excluded, ignoreCase = true)
+            // Reply detection logging removed - now handled by detectReplyContext()
+
+            // EXCLUDE nodes with specific ViewIDs (timestamps, status, etc.)
+            val isExcludedViewId = excludedViewIds.any { excluded ->
+                viewId.contains(excluded, ignoreCase = true)
+            }
+
+            if (isExcludedViewId) {
+                for (i in 0 until node.childCount) {
+                    node.getChild(i)?.let { child ->
+                        searchNodes(child, depth + 1)
+                        child.recycle()
+                    }
+                }
+                return
+            }
+
+            // LOG ALL views with interesting viewIds for debugging (to find image/video viewIds)
+            val classShort = className.substringAfterLast('.')
+
+            // Log views that might be media-related
+            val mediaRelatedKeywords = listOf("media", "image", "video", "photo", "picture", "thumbnail", "preview", "playback", "player")
+            val isMediaRelatedViewId = mediaRelatedKeywords.any { keyword ->
+                viewIdShort.contains(keyword, ignoreCase = true)
+            }
+
+            if (isMediaRelatedViewId && viewIdShort.isNotBlank()) {
+                Log.d(TAG, "📷 MEDIA-RELATED VIEW: viewId='$viewIdShort' | class='$classShort' | desc='${contentDesc.take(50)}'")
+            }
+
+            // Log ImageViews
+            if (className.contains("ImageView", ignoreCase = true)) {
+                val hasDesc = contentDesc.isNotBlank()
+                if (hasDesc) {
+                    Log.d(TAG, "🔍 IMAGEVIEW: desc='$contentDesc' | viewId='$viewIdShort'")
+                } else if (viewIdShort.isNotBlank() && !viewIdShort.contains("avatar") && !viewIdShort.contains("icon")) {
+                    Log.d(TAG, "🔍 IMAGEVIEW (no desc): viewId='$viewIdShort'")
+                }
+            }
+
+            // Log VideoViews or any view with "video" in class name
+            if (className.contains("Video", ignoreCase = true) || className.contains("Player", ignoreCase = true)) {
+                Log.d(TAG, "🎬 VIDEO VIEW: viewId='$viewIdShort' | class='$classShort' | desc='${contentDesc.take(50)}'")
+            }
+
+            // Check for MEDIA messages - ONLY from specific valid viewIds
+            val matchesValidMediaViewId = validMediaViewIds.any { pattern ->
+                viewIdShort.equals(pattern, ignoreCase = true)
+            }
+
+            // ONLY accept media from valid viewIds
+            // Note: media_container is used for both photos and videos - differentiated by content desc
+            val isMediaNode = matchesValidMediaViewId
+
+            // Special case: Voice messages (message_content_voice_playback_timer) have no content description
+            if (isMediaNode && viewIdShort.equals("message_content_voice_playback_timer", ignoreCase = true)) {
+                // Use position-based deduplication like other media types
+                val bounds = android.graphics.Rect()
+                node.getBoundsInScreen(bounds)
+                // Create unique identifier using position
+                val mediaId = "voice_note-${bounds.top}-${bounds.left}"
+                if (!processedMediaIds.contains(mediaId)) {
+                    processedMediaIds.add(mediaId)
+                    Log.d(TAG, "🎤 VOICE MESSAGE DETECTED: viewId='$viewIdShort' pos=(${bounds.left},${bounds.top})")
+                    // Use generic text for database duplicate detection
+                    val voiceText = "Voice message"
+                    // Check for quoted message in bubble
+                    val quotedMessageText = findQuotedMessageInBubble(node)
+                    messages.add(DetectedMessage(
+                        text = voiceText,
+                        assetType = AssetType.VOICE_NOTE,
+                        node = AccessibilityNodeInfo.obtain(node),
+                        quotedMessageText = quotedMessageText
+                    ))
+                    Log.d(TAG, "✓ DETECTED [voice_note]: '$voiceText'${if (quotedMessageText != null) " (reply to: '$quotedMessageText')" else ""}")
+                }
+            }
+
+            if (isMediaNode && contentDesc.isNotBlank()) {
+                val contentDescLower = contentDesc.lowercase()
+
+                // EXCLUDE UI elements based on content description
+                val isExcludedContent = excludedContentDesc.any { excluded ->
+                    contentDescLower.contains(excluded)
                 }
 
-                if (isExcludedViewId) {
-                    for (i in 0 until node.childCount) {
-                        node.getChild(i)?.let { child ->
-                            searchNodes(child, depth + 1)
-                            child.recycle()
+                if (isExcludedContent) {
+                    Log.d(TAG, "⊘ EXCLUDED (UI element): '$contentDesc'")
+                } else {
+                    // Detect specific media types from content description
+                    // Based on Instagram's format: "username sent a [type]" or "Sticker gif..."
+                    // Order matters - check more specific patterns first
+                    val assetType = when {
+                        // Sticker - "sent a sticker" or starts with "Sticker"
+                        contentDescLower.contains("sent a sticker") ||
+                        contentDescLower.startsWith("sticker") -> AssetType.STICKER
+
+                        // GIF - "sent a GIF"
+                        contentDescLower.contains("sent a gif") -> AssetType.GIF
+
+                        // Video - "sent a video" or "sent a reel"
+                        contentDescLower.contains("sent a video") ||
+                        contentDescLower.contains("sent a reel") -> AssetType.VIDEO
+
+                        // Voice message - "sent a voice message"
+                        contentDescLower.contains("sent a voice") ||
+                        contentDescLower.contains("voice message") -> AssetType.VOICE_NOTE
+
+                        // Photo/Image - "sent a photo" (most common)
+                        contentDescLower.contains("sent a photo") ||
+                        contentDescLower.contains("sent a image") ||
+                        contentDescLower.contains("sent an image") -> AssetType.IMAGE
+
+                        // If none of the above, log it and skip
+                        else -> {
+                            Log.d(TAG, "❓ UNKNOWN MEDIA: desc='$contentDesc' | viewId='$viewIdShort'")
+                            null
                         }
                     }
-                    return
-                }
 
+                    if (assetType != null) {
+                        // Get screen position to make each media unique within this scan
+                        // (different photos have different positions, prevents duplicate detection in same scan)
+                        val bounds = android.graphics.Rect()
+                        node.getBoundsInScreen(bounds)
+                        // Create unique identifier using position for in-memory tracking
+                        val mediaId = "$assetType-${bounds.top}-${bounds.left}"
+                        if (!processedMediaIds.contains(mediaId)) {
+                            processedMediaIds.add(mediaId)
+                            // Check for quoted message in bubble
+                            val quotedMessageText = findQuotedMessageInBubble(node)
+                            // Don't store position - just use content desc for logging
+                            messages.add(DetectedMessage(
+                                text = contentDesc,
+                                assetType = assetType,
+                                node = AccessibilityNodeInfo.obtain(node),
+                                quotedMessageText = quotedMessageText
+                            ))
+                            Log.d(TAG, "✓ DETECTED [$assetType]: '$contentDesc' at pos(${bounds.left},${bounds.top})${if (quotedMessageText != null) " (reply to: '$quotedMessageText')" else ""}")
+                        }
+                    }
+                }
+            }
+
+            // Check for TEXT messages
+            if (node.text != null && node.text.isNotEmpty()) {
+                val text = node.text.toString().trim()
+
+                // Check if this looks like a text message node by ViewID
                 val matchesMessageViewId = messageViewIdPatterns.any { pattern ->
                     viewId.contains(pattern, ignoreCase = true)
                 }
@@ -858,7 +1553,37 @@ private suspend fun captureNewMessages() {
                     !timePattern.matches(text)
 
                 if (matchesMessageViewId && isTextView && isNotUIElement && text.length in 1..1000) {
-                    messages.add(AccessibilityNodeInfo.obtain(node))
+                    if (ULTRA_DEEP_LOGGING) {
+                        Log.d(TAG, "📋 TEXT NODE FOUND: '$text' | viewId='$viewIdShort'")
+                    }
+
+                    // CRITICAL: Exclude messages inside the reply bar (quoted message previews)
+                    if (!isInsideReplyBar(node)) {
+                        // Check if this message bubble contains a quoted message (for received replies)
+                        val quotedMessageText = findQuotedMessageInBubble(node)
+
+                        messages.add(DetectedMessage(
+                            text = text,
+                            assetType = AssetType.TEXT,
+                            node = AccessibilityNodeInfo.obtain(node),
+                            quotedMessageText = quotedMessageText
+                        ))
+                        if (ULTRA_DEEP_LOGGING) {
+                            Log.d(TAG, "  ✅ ADDED to detection list${if (quotedMessageText != null) " (has quote: '$quotedMessageText')" else ""}")
+                        }
+                    } else {
+                        Log.d(TAG, "  ⊘ EXCLUDED (inside reply bar): '$text'")
+                    }
+                } else if (ULTRA_DEEP_LOGGING && node.text != null && node.text.isNotEmpty()) {
+                    val text = node.text.toString().trim()
+                    val reason = when {
+                        !matchesMessageViewId -> "viewId doesn't match message patterns"
+                        !isTextView -> "not a TextView"
+                        !isNotUIElement -> "is UI element"
+                        text.length !in 1..1000 -> "text length out of range (${text.length})"
+                        else -> "unknown"
+                    }
+                    Log.v(TAG, "  ⏭️ SKIPPED TEXT NODE: '$text' | Reason: $reason")
                 }
             }
 
@@ -876,6 +1601,75 @@ private suspend fun captureNewMessages() {
 
     private fun extractMessageText(node: AccessibilityNodeInfo): String {
         return node.text?.toString()?.trim() ?: ""
+    }
+
+    /**
+     * Detects the type of media from an accessibility node.
+     * Checks content descriptions and view IDs for media indicators.
+     */
+    private fun detectMediaType(node: AccessibilityNodeInfo): String {
+        val contentDesc = node.contentDescription?.toString()?.lowercase() ?: ""
+        val viewId = node.viewIdResourceName?.lowercase() ?: ""
+        val className = node.className?.toString()?.lowercase() ?: ""
+
+        // Check content description for media indicators
+        return when {
+            // GIF detection (check first as GIFs may also contain "image")
+            contentDesc.contains("gif") || viewId.contains("gif") -> AssetType.GIF
+
+            // Video detection
+            contentDesc.contains("video") || viewId.contains("video") ||
+            contentDesc.contains("reel") -> AssetType.VIDEO
+
+            // Voice note detection
+            contentDesc.contains("voice") || contentDesc.contains("audio") ||
+            viewId.contains("voice") || viewId.contains("audio") ||
+            contentDesc.contains("voice message") -> AssetType.VOICE_NOTE
+
+            // Sticker detection
+            contentDesc.contains("sticker") || viewId.contains("sticker") -> AssetType.STICKER
+
+            // Image detection (photos)
+            contentDesc.contains("photo") || contentDesc.contains("image") ||
+            viewId.contains("photo") || viewId.contains("image") ||
+            className.contains("imageview") -> AssetType.IMAGE
+
+            // Default to text if no media indicators found
+            else -> AssetType.TEXT
+        }
+    }
+
+    /**
+     * Checks if a node or its ancestors represent a media message.
+     * Returns the asset type if media is detected.
+     */
+    private fun detectMediaTypeFromHierarchy(node: AccessibilityNodeInfo): String {
+        // First check the node itself
+        var assetType = detectMediaType(node)
+        if (assetType != AssetType.TEXT) {
+            return assetType
+        }
+
+        // Check parent nodes for media containers
+        var currentNode: AccessibilityNodeInfo? = node.parent
+        var depth = 0
+        val maxDepth = 5
+
+        while (currentNode != null && depth < maxDepth) {
+            assetType = detectMediaType(currentNode)
+            if (assetType != AssetType.TEXT) {
+                currentNode.recycle()
+                return assetType
+            }
+
+            val parent = currentNode.parent
+            currentNode.recycle()
+            currentNode = parent
+            depth++
+        }
+
+        currentNode?.recycle()
+        return AssetType.TEXT
     }
 
     private fun isMessageSentByUser(node: AccessibilityNodeInfo): Boolean {

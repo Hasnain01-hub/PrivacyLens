@@ -15,16 +15,26 @@ data class Contact(
     val timestamp: Long = System.currentTimeMillis()
 )
 
+// Asset types for messages
+object AssetType {
+    const val TEXT = "text"
+    const val IMAGE = "image"
+    const val VIDEO = "video"
+    const val GIF = "gif"
+    const val STICKER = "sticker"
+    const val VOICE_NOTE = "voice_note"
+}
+
 @Entity(tableName = "messages")
 data class Message(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
-     val contactName: String,
-    val messageText: String?,  // Changed to nullable for gifts
+    val contactName: String,
+    val messageText: String = "",  // Can be empty for media messages
     val timestamp: Long = System.currentTimeMillis(),
     val isSentByUser: Boolean = false,
-    val isGift: Int = 0,  // 0 = not a gift, 1 = is a gift
-    val replyToMessageId: Long? = null,  // Reference to original message if this is a reply
-    val replyToMessageText: String? = null 
+    val assetType: String = AssetType.TEXT,  // text, image, video, gif, sticker, voice_note
+    val replyMessage: String? = null,  // The text of the message being replied to
+    val replyMessageID: Long? = null   // The database ID of the message being replied to
 )
 
 @Dao
@@ -94,13 +104,29 @@ interface MessageDao {
             timestamp,
             datetime(timestamp/1000, 'unixepoch', 'localtime') as readableTime,
             isSentByUser,
-            isGift,
-            replyToMessageId,
-            replyToMessageText
+            assetType,
+            replyMessage,
+            replyMessageID
         FROM messages
         ORDER BY timestamp DESC
     """)
     suspend fun getAllMessagesWithReadableTime(): List<MessageWithReadableTime>
+
+    // Find duplicate message including asset type
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText AND assetType = :assetType LIMIT 1")
+    suspend fun findDuplicateMessageWithAsset(contactName: String, messageText: String, assetType: String): Message?
+
+    // Find recent voice message from contact (within time window to detect duplicates)
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = 'voice_note' AND timestamp > :afterTimestamp ORDER BY timestamp DESC LIMIT 1")
+    suspend fun findRecentVoiceMessage(contactName: String, afterTimestamp: Long): Message?
+
+    // Find recent media of specific type from contact (within time window to detect duplicates)
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = :assetType AND timestamp > :afterTimestamp ORDER BY timestamp DESC LIMIT 1")
+    suspend fun findRecentMedia(contactName: String, assetType: String, afterTimestamp: Long): Message?
+
+    // Find message by contact and text (for reply lookup)
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText ORDER BY timestamp DESC LIMIT 1")
+    suspend fun findMessageByText(contactName: String, messageText: String): Message?
 }
 
 // Data class for messages with readable timestamp
@@ -109,16 +135,16 @@ data class MessageWithReadableTime(
     val contactName: String,
     val messageText: String?,
     val timestamp: Long,
-    val readableTime: String,
+    val readableTime: String,  // e.g., "2024-12-30 16:15:17"
     val isSentByUser: Boolean,
-    val isGift: Int,
-    val replyToMessageId: Long?,
-    val replyToMessageText: String?
+    val assetType: String,
+    val replyMessage: String?,
+    val replyMessageID: Long?
 )
 
 @Database(
     entities = [Contact::class, Message::class],
-    version = 4,  // Incremented due to new queries
+    version = 5,  // Incremented for replyMessage and replyMessageID columns
     exportSchema = true  // Changed to true for debugging
 )
 abstract class InstagramDatabase : RoomDatabase() {
