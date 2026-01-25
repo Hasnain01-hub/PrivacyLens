@@ -23,6 +23,7 @@ object AssetType {
     const val GIF = "gif"
     const val STICKER = "sticker"
     const val VOICE_NOTE = "voice_note"
+    const val GIFT = "gift" 
 }
 
 @Entity(tableName = "messages")
