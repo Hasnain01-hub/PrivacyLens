@@ -15,6 +15,27 @@ data class Contact(
     val timestamp: Long = System.currentTimeMillis()
 )
 
+class TimeConverters {
+
+    @androidx.room.TypeConverter
+    fun fromEpochToReadable(epochMs: Long?): String? {
+        if (epochMs == null || epochMs <= 0L) return null
+        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
+        return sdf.format(java.util.Date(epochMs))
+    }
+
+    @androidx.room.TypeConverter
+    fun fromReadableToEpoch(readable: String?): Long? {
+        if (readable.isNullOrBlank()) return null
+        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
+        return try {
+            sdf.parse(readable)?.time
+        } catch (_: Exception) {
+            null
+        }
+    }
+}
+
 // Asset types for messages
 object AssetType {
     const val TEXT = "text"
@@ -35,14 +56,15 @@ object AssetType {
 data class Message(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val contactName: String,
-    val messageText: String = "",  // Can be empty for media messages
-    val timestamp: Long = System.currentTimeMillis(),
+    val messageText: String = "",
+    val timestamp: String,
     val isSentByUser: Boolean = false,
-    val assetType: String = AssetType.TEXT,  // text, image, video, gif, sticker, voice_note
-    val replyMessage: String? = null,  // The text of the message being replied to
-    val replyMessageID: Long? = null,   // The database ID of the message being replied to
-     val fingerprint: String
+    val assetType: String = AssetType.TEXT,
+    val replyMessage: String? = null,
+    val replyMessageID: Long? = null,
+    val fingerprint: String
 )
+
 
 @Dao
 interface ContactDao {
@@ -124,12 +146,13 @@ interface MessageDao {
     suspend fun findDuplicateMessageWithAsset(contactName: String, messageText: String, assetType: String): Message?
 
     // Find recent voice message from contact (within time window to detect duplicates)
-    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = 'voice_note' AND timestamp > :afterTimestamp ORDER BY timestamp DESC LIMIT 1")
-    suspend fun findRecentVoiceMessage(contactName: String, afterTimestamp: Long): Message?
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = 'voice_note' AND timestamp > :afterTimestampReadable ORDER BY timestamp DESC LIMIT 1")
+    suspend fun findRecentVoiceMessage(contactName: String, afterTimestampReadable: String): Message?
 
     // Find recent media of specific type from contact (within time window to detect duplicates)
-    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = :assetType AND timestamp > :afterTimestamp ORDER BY timestamp DESC LIMIT 1")
-    suspend fun findRecentMedia(contactName: String, assetType: String, afterTimestamp: Long): Message?
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = :assetType AND timestamp > :afterTimestampReadable ORDER BY timestamp DESC LIMIT 1")
+    suspend fun findRecentMedia(contactName: String, assetType: String, afterTimestampReadable: String): Message?
+
 
     // Find message by contact and text (for reply lookup)
     @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText ORDER BY timestamp DESC LIMIT 1")
@@ -154,7 +177,8 @@ data class MessageWithReadableTime(
     version = 5,  // Incremented for replyMessage and replyMessageID columns
     exportSchema = true  // Changed to true for debugging
 )
-abstract class InstagramDatabase : RoomDatabase() {
+@androidx.room.TypeConverters(TimeConverters::class)
+abstract class InstagramDatabase : androidx.room.RoomDatabase(){
     abstract fun contactDao(): ContactDao
     abstract fun messageDao(): MessageDao
     
