@@ -199,6 +199,218 @@ class InstagramAccessibilityService : AccessibilityService() {
         }
     }
 
+data class UiTimestamp(
+    val raw: String,
+    val epochMs: Long?,
+    val y: Int,
+    val x: Int
+)
+
+private fun parseInstagramTimestampLabelToEpochMs(
+    rawLabel: String,
+    nowMs: Long = System.currentTimeMillis()
+): Long? {
+    val label = rawLabel.trim()
+    if (label.isBlank()) return null
+
+    val lower = label.lowercase()
+
+    // Ignore "Seen", "Active", etc.
+    if (lower.startsWith("seen") || lower.startsWith("active") || lower.contains("typing")) return null
+
+    val nowCal = java.util.Calendar.getInstance().apply { timeInMillis = nowMs }
+
+    fun calAtNoon(base: java.util.Calendar): java.util.Calendar {
+        return (base.clone() as java.util.Calendar).apply {
+            set(java.util.Calendar.HOUR_OF_DAY, 12)
+            set(java.util.Calendar.MINUTE, 0)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+    }
+
+    fun tryParseTimeOnly(s: String): Pair<Int, Int>? {
+        // Handles: 13:45, 1:45 PM, 01:45am
+        val t = s.trim()
+        val m = Regex("""^(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?$""").find(t) ?: return null
+        var hh = m.groupValues[1].toInt()
+        val mm = m.groupValues[2].toInt()
+        val ampm = m.groupValues.getOrNull(3)?.lowercase()?.trim().orEmpty()
+        if (ampm == "pm" && hh in 1..11) hh += 12
+        if (ampm == "am" && hh == 12) hh = 0
+        if (hh !in 0..23 || mm !in 0..59) return null
+        return hh to mm
+    }
+
+    fun setTime(cal: java.util.Calendar, hh: Int, mm: Int): java.util.Calendar {
+        return (cal.clone() as java.util.Calendar).apply {
+            set(java.util.Calendar.HOUR_OF_DAY, hh)
+            set(java.util.Calendar.MINUTE, mm)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+    }
+
+    fun dayOfWeekFromLabel(s: String): Int? {
+        // English short/long; extend if you need DE etc.
+        val map = mapOf(
+            "mon" to java.util.Calendar.MONDAY, "monday" to java.util.Calendar.MONDAY,
+            "tue" to java.util.Calendar.TUESDAY, "tues" to java.util.Calendar.TUESDAY, "tuesday" to java.util.Calendar.TUESDAY,
+            "wed" to java.util.Calendar.WEDNESDAY, "wednesday" to java.util.Calendar.WEDNESDAY,
+            "thu" to java.util.Calendar.THURSDAY, "thur" to java.util.Calendar.THURSDAY, "thurs" to java.util.Calendar.THURSDAY, "thursday" to java.util.Calendar.THURSDAY,
+            "fri" to java.util.Calendar.FRIDAY, "friday" to java.util.Calendar.FRIDAY,
+            "sat" to java.util.Calendar.SATURDAY, "saturday" to java.util.Calendar.SATURDAY,
+            "sun" to java.util.Calendar.SUNDAY, "sunday" to java.util.Calendar.SUNDAY
+        )
+        val key = s.trim().lowercase()
+        return map[key]
+    }
+
+    fun mostRecentDow(dow: Int, baseMs: Long): java.util.Calendar {
+        val cal = java.util.Calendar.getInstance().apply { timeInMillis = baseMs }
+        // Walk back up to 7 days until we hit requested day-of-week
+        for (i in 0..7) {
+            if (cal.get(java.util.Calendar.DAY_OF_WEEK) == dow) return cal
+            cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+        }
+        return cal
+    }
+
+    // 1) Pure time: "13:45" / "1:45 PM"
+    tryParseTimeOnly(label)?.let { (hh, mm) ->
+        val today = (nowCal.clone() as java.util.Calendar).apply {
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+        return setTime(today, hh, mm).timeInMillis
+    }
+
+    // 2) Relative: "Yesterday"
+    if (lower == "yesterday") {
+        val y = calAtNoon(nowCal)
+        y.add(java.util.Calendar.DAY_OF_YEAR, -1)
+        return y.timeInMillis
+    }
+
+    // 3) Day-of-week only: "Mon"
+    dayOfWeekFromLabel(label)?.let { dow ->
+        val cal = mostRecentDow(dow, nowMs)
+        return calAtNoon(cal).timeInMillis
+    }
+
+    // 4) "Mon 12" (dow + day-of-month)
+    run {
+        val m = Regex("""^(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(\d{1,2})$""",
+            RegexOption.IGNORE_CASE
+        ).find(label)
+
+        if (m != null) {
+            val dow = dayOfWeekFromLabel(m.groupValues[1]) ?: return@run
+            val dom = m.groupValues[2].toInt()
+
+            // Choose the most plausible date: start from current month, walk back up to 14 months.
+            val probe = java.util.Calendar.getInstance().apply { timeInMillis = nowMs }
+            for (i in 0..14) {
+                val c = (probe.clone() as java.util.Calendar).apply {
+                    set(java.util.Calendar.DAY_OF_MONTH, dom)
+                    set(java.util.Calendar.HOUR_OF_DAY, 12)
+                    set(java.util.Calendar.MINUTE, 0)
+                    set(java.util.Calendar.SECOND, 0)
+                    set(java.util.Calendar.MILLISECOND, 0)
+                }
+                // Ensure calendar didn't roll (invalid dom like Feb 30)
+                if (c.get(java.util.Calendar.DAY_OF_MONTH) == dom &&
+                    c.get(java.util.Calendar.DAY_OF_WEEK) == dow &&
+                    c.timeInMillis <= nowMs
+                ) {
+                    return c.timeInMillis
+                }
+                probe.add(java.util.Calendar.MONTH, -1)
+            }
+        }
+    }
+
+    // 5) "Last year"
+    if (lower == "last year") {
+        val c = calAtNoon(nowCal)
+        c.add(java.util.Calendar.YEAR, -1)
+        return c.timeInMillis
+    }
+
+    // 6) If we cannot parse: return null
+    return null
+}
+
+private fun collectUiTimestamps(rootNode: AccessibilityNodeInfo): List<UiTimestamp> {
+    val out = mutableListOf<UiTimestamp>()
+
+    fun looksLikeTimestampText(t: String): Boolean {
+        val s = t.trim()
+        if (s.isBlank()) return false
+        val lower = s.lowercase()
+
+        // Avoid common non-timestamp UI strings
+        if (lower.startsWith("seen") || lower.contains("type a message") || lower == "messages") return false
+
+        return Regex("""^\d{1,2}:\d{2}(\s*[AaPp][Mm])?$""").matches(s) ||  // 13:45, 1:45 PM
+                lower == "yesterday" ||
+                lower == "last year" ||
+                Regex("""^(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(\s+\d{1,2})?$""",
+                    RegexOption.IGNORE_CASE
+                ).matches(s)
+    }
+
+    fun walk(n: AccessibilityNodeInfo, depth: Int = 0) {
+        if (depth > 18) return
+
+        val text = n.text?.toString()?.trim().orEmpty()
+        val viewId = n.viewIdResourceName.orEmpty()
+        val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
+        val className = n.className?.toString().orEmpty()
+
+        val maybeTimestamp =
+            (viewIdShort.contains("timestamp", ignoreCase = true) || looksLikeTimestampText(text)) &&
+            className.contains("TextView", ignoreCase = true) &&
+            text.isNotBlank()
+
+        if (maybeTimestamp) {
+            val bounds = android.graphics.Rect()
+            n.getBoundsInScreen(bounds)
+            val epoch = parseInstagramTimestampLabelToEpochMs(text)
+            out.add(UiTimestamp(raw = text, epochMs = epoch, y = bounds.centerY(), x = bounds.centerX()))
+        }
+
+        for (i in 0 until n.childCount) {
+            n.getChild(i)?.let { c ->
+                walk(c, depth + 1)
+                c.recycle()
+            }
+        }
+    }
+
+    walk(rootNode)
+    return out
+}
+
+private fun pickBestTimestampForMessage(
+    messageBounds: android.graphics.Rect,
+    uiTimestamps: List<UiTimestamp>
+): Long? {
+    if (uiTimestamps.isEmpty()) return null
+
+    val msgY = messageBounds.centerY()
+    val msgX = messageBounds.centerX()
+
+    // Heuristic: closest by vertical distance, small horizontal penalty
+    val best = uiTimestamps.minByOrNull { ts ->
+        val dy = kotlin.math.abs(ts.y - msgY)
+        val dx = kotlin.math.abs(ts.x - msgX)
+        dy * 10 + dx
+    }
+
+    return best?.epochMs
+}
+
 
 private fun extractMessageData(messageNode: AccessibilityNodeInfo): MessageData {
     var messageText: String? = null
@@ -667,7 +879,14 @@ private suspend fun captureNewMessages() {
             // }
 
             val currentTime = System.currentTimeMillis()
+            val uiTimestamps = collectUiTimestamps(rootNode)
 
+            if (ULTRA_DEEP_LOGGING) {
+                Log.d(TAG, "⏱️ UI TIMESTAMPS FOUND: ${uiTimestamps.size}")
+                uiTimestamps.take(10).forEach { ts ->
+                    Log.d(TAG, "   - '${ts.raw}' -> ${ts.epochMs ?: "unparsed"} (x=${ts.x}, y=${ts.y})")
+                }
+            }
             // Clean up old entries from caches (keep only last 60 seconds)
             val cacheCleanupThreshold = currentTime - maxOf(
                 SENT_MESSAGE_DUPLICATE_WINDOW_MS,
@@ -771,7 +990,17 @@ if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPL
 }
 
                 if (shouldSave) {
-                    val timestamp = System.currentTimeMillis()
+                    val boundsForTs = android.graphics.Rect()
+                    detected.node.getBoundsInScreen(boundsForTs)
+
+                    val parsedTs = pickBestTimestampForMessage(boundsForTs, uiTimestamps)
+                    val timestamp = parsedTs ?: System.currentTimeMillis()
+
+                    if (ULTRA_DEEP_LOGGING && parsedTs != null) {
+                        Log.d(TAG, "⏱️ USING CHAT TIMESTAMP: $parsedTs for '${detected.text.take(40)}'")
+                    } else if (ULTRA_DEEP_LOGGING && parsedTs == null) {
+                        Log.d(TAG, "⏱️ FALLBACK TIMESTAMP (system) for '${detected.text.take(40)}'")
+                    }
 
                     // Get Y position of this message for reply inference
                     val bounds = android.graphics.Rect()
@@ -839,11 +1068,14 @@ if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPL
                             detected.node.recycle()
                             return@forEach
                         }
+                    val epochMs = timestamp 
+                    val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
+                    val timestampReadable = sdf.format(java.util.Date(epochMs))
                     val message = Message(
                         id = 0,
                         contactName = contactName,
                         messageText = messageText,  // Empty for media, actual text for text messages
-                        timestamp = timestamp,
+                        timestamp = timestampReadable,
                         isSentByUser = isSentByUser,
                         assetType = assetType,
                         replyMessage = replyMessage,
