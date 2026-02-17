@@ -860,7 +860,7 @@ private suspend fun captureNewMessages() {
             // Find all message nodes (text and media)
             val detectedMessages = findMessageNodes(rootNode)
             var newMessageCount = 0
-
+            var lastSavedMessageId: Long? = messageDao.getLastMessageId(contactName)
             if (ULTRA_DEEP_LOGGING) {
                 Log.d(TAG, "╔════════════════════════════════════════════╗")
                 Log.d(TAG, "║ SCAN SUMMARY                               ║")
@@ -1070,18 +1070,25 @@ if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPL
                         }
                     val epochMs = timestamp 
                     val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
-                    val timestampReadable = sdf.format(java.util.Date(epochMs))
-                    val message = Message(
-                        id = 0,
-                        contactName = contactName,
-                        messageText = messageText,  // Empty for media, actual text for text messages
-                        timestamp = timestampReadable,
-                        isSentByUser = isSentByUser,
-                        assetType = assetType,
-                        replyMessage = replyMessage,
-                        replyMessageID = replyMessageID,
-                        fingerprint = fp
-                    )
+                    val hadRealTimestamp = parsedTs != null
+                    val timestampReadable: String? = if (hadRealTimestamp) {
+                        val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
+                        sdf.format(java.util.Date(parsedTs!!))
+                    } else {
+                        null  // No real timestamp — don't fabricate one
+                    }
+                   val message = Message(
+                    id = 0,
+                    contactName = contactName,
+                    messageText = messageText,
+                    timestamp = timestampReadable, 
+                    isSentByUser = isSentByUser,
+                    assetType = assetType,
+                    replyMessage = replyMessage,
+                    replyMessageID = replyMessageID,
+                    fingerprint = fp,
+                    previousMessageId = if (!hadRealTimestamp) lastSavedMessageId else null  // only set if no real ts
+                )
 
                     if (ULTRA_DEEP_LOGGING) {
                         Log.d(TAG, "  💾 SAVING TO DATABASE:")
@@ -1095,6 +1102,7 @@ if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPL
                     }
 
                     val messageId = messageDao.insert(message)
+                    lastSavedMessageId = messageId
                     newMessageCount++
 
                     val preview = if (assetType == AssetType.TEXT) messageText.take(50) else detected.text.take(50)

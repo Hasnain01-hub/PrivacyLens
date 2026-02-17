@@ -57,12 +57,13 @@ data class Message(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val contactName: String,
     val messageText: String = "",
-    val timestamp: String,
+    val timestamp: String? = null,
     val isSentByUser: Boolean = false,
     val assetType: String = AssetType.TEXT,
     val replyMessage: String? = null,
     val replyMessageID: Long? = null,
-    val fingerprint: String
+    val fingerprint: String,
+    val previousMessageId: Long? = null
 )
 
 
@@ -108,6 +109,9 @@ interface MessageDao {
 
     @Query("SELECT * FROM messages WHERE id = :messageId LIMIT 1")
     suspend fun getMessageById(messageId: Long): Message?
+    
+    @Query("SELECT id FROM messages WHERE contactName = :contactName ORDER BY rowid DESC LIMIT 1")
+    suspend fun getLastMessageId(contactName: String): Long?
 
     @Query("SELECT * FROM messages WHERE contactName = :contactName ORDER BY timestamp ASC")
     suspend fun getMessagesByContact(contactName: String): List<Message>
@@ -174,7 +178,7 @@ data class MessageWithReadableTime(
 
 @Database(
     entities = [Contact::class, Message::class],
-    version = 5,  // Incremented for replyMessage and replyMessageID columns
+    version = 6, 
     exportSchema = true  // Changed to true for debugging
 )
 @androidx.room.TypeConverters(TimeConverters::class)
