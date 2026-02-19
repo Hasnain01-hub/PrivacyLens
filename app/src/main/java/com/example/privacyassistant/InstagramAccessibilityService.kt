@@ -43,6 +43,7 @@ class InstagramAccessibilityService : AccessibilityService() {
 
     private var isInDirectMessages = false
     private var currentChatContact: String? = null
+    private val dateGroupRootId = mutableMapOf<String, Long>() // "contactName|date" -> root message ID
 
     // Count-based dedup for media: tracks how many of each media type have been saved
     // Key: "contactName|assetType|isSentByUser", Value: saved count
@@ -856,7 +857,7 @@ fun exportDataToFile() {
                 } catch (e: Exception) {
                     Log.e(TAG, "Error loading media counts: ${e.message}")
                 }
-
+                dateGroupRootId.clear()
                 // Save contact if not already saved
                 saveContact(contactName)
 
@@ -1033,15 +1034,24 @@ private suspend fun captureNewMessages() {
                         msgGroupLabelId = existingFirstId
                     }
                 } else {
-                    // Label has no time (e.g. "24 Dec 2020", "Yesterday")
-                    // Check DB: is there already any message for this date?
+                val dateKey = "$contactName|$msgDate"
+                val cachedRootId = dateGroupRootId[dateKey]
+
+                if (cachedRootId != null) {
+                    // Already know the root for this date — point to it
+                    msgTime = null
+                    msgGroupLabelId = cachedRootId
+                } else {
+                    // Not in cache — check DB
                     val existingFirstId = messageDao.getFirstMessageIdByDate(contactName, msgDate)
                     if (existingFirstId == null) {
-                        // No message yet → this IS the first for this date
+                        // This message will BE the root — no groupLabelMessageId
+                        // We'll cache its ID after insert below
                         msgTime = null
                         msgGroupLabelId = null
                     } else {
-                        // First message already exists → point to it
+                        // DB already has a root — cache and point to it
+                        dateGroupRootId[dateKey] = existingFirstId
                         msgTime = null
                         msgGroupLabelId = existingFirstId
                     }
@@ -1067,6 +1077,12 @@ private suspend fun captureNewMessages() {
             val messageId = messageDao.insert(message)
             if (messageId != -1L) {
                 newMessageCount++
+                if (message.groupLabelMessageId == null && message.date != null && message.time == null) {
+                val dateKey = "$contactName|${message.date}"
+            if (!dateGroupRootId.containsKey(dateKey)) {
+                    dateGroupRootId[dateKey] = messageId
+                }
+            }
                 val direction = if (mi.isSentByUser) "SENT" else "RECEIVED"
                 val ordStr = if (ordinal != null) ", ordinal: $ordinal" else ""
                 Log.d(TAG, "  ✅ SAVED [$logTag] [$direction]: '${mi.detected.text.take(50)}' (ID: $messageId$ordStr, date=$msgDate, time=$msgTime, groupRef=$msgGroupLabelId)")
