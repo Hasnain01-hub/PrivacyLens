@@ -17,12 +17,10 @@ import java.util.*
 
 data class MessageData(
     val messageText: String?,
-    val isGift: Int,
-    val replyToText: String?
+    val isGift: Int
 ) {
     fun isValid(): Boolean {
-        // Valid if has text, is a gift, or is a reply
-        return !messageText.isNullOrBlank() || isGift == 1 || replyToText != null
+        return !messageText.isNullOrBlank() || isGift == 1
     }
 }
 
@@ -46,42 +44,24 @@ class InstagramAccessibilityService : AccessibilityService() {
     private var isInDirectMessages = false
     private var currentChatContact: String? = null
 
-    // Text message deduplication: track text with timestamps
-    // Key: "contactName-text-isSentByUser", Value: timestamp
-    private val textMessageCache = mutableMapOf<String, Long>()
+    // Count-based dedup for media: tracks how many of each media type have been saved
+    // Key: "contactName|assetType|isSentByUser", Value: saved count
+    // Initialized from DB on chat open, incremented when saving new media
+    private val mediaSavedCounts = mutableMapOf<String, Int>()
 
-    // Media deduplication: track content descriptions with timestamps
-    // Key: "contactName-assetType-contentDescription", Value: timestamp
-    private val mediaContentCache = mutableMapOf<String, Long>()
+    // Tracks how many of each media type were visible on the PREVIOUS scan
+    // Used to detect when new media appears (currentVisible > prevVisible)
+    private val prevVisibleMediaCounts = mutableMapOf<String, Int>()
+    private var mediaCalibrated = false  // false = first scan uses DB count, true = use prevVisible
 
-    // Time windows for deduplication
-    private val SENT_MESSAGE_DUPLICATE_WINDOW_MS = 60000L // 60 seconds for sent messages (longer because they stay visible and get rescanned)
-    private val RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS = 300000L // 5 minutes for received messages (prevents re-saving when scrolling or returning to chat)
-
-    // Store reply context between scans with timestamp
-    // Triple: (replyText, replyMessageID, timestamp when stored)
-    private var pendingReplyContext: Triple<String, Long, Long>? = null
-    private val REPLY_CONTEXT_TIMEOUT_MS = 60000L // Keep reply context for 60 seconds to allow multiple replies in sequence
-
-    // Track recent messages for position-based reply inference
-    // List of (messageText, messageID, timestamp, yPosition, isSentByUser)
-    private val recentMessagesForReplyInference = mutableListOf<RecentMessageInfo>()
-    private val REPLY_INFERENCE_WINDOW_MS = 15000L // 15 seconds window for inferring replies
-
-    data class RecentMessageInfo(
-        val messageText: String,
-        val messageId: Long,
-        val timestamp: Long,
-        val yPosition: Int,
-        val isSentByUser: Boolean
-    )
+    // Cache text fingerprints to avoid wasting auto-increment IDs on repeated IGNORE inserts
+    private val savedTextFingerprints = mutableSetOf<String>()
 
     // Data class to hold detected message info
     data class DetectedMessage(
         val text: String,
         val assetType: String,
-        val node: AccessibilityNodeInfo,
-        val quotedMessageText: String? = null  // For received messages that are replies
+        val node: AccessibilityNodeInfo
     )
 
     private var lastMessageCaptureTime = 0L
@@ -199,17 +179,26 @@ class InstagramAccessibilityService : AccessibilityService() {
         }
     }
 
+// Parsed result from a group label
+data class ParsedGroupLabel(
+    val date: String?,  // "yyyy-MM-dd", null if unparseable
+    val time: String?,  // "HH:mm:ss", null if label has no time component
+    val epochMs: Long?  // for ordering/comparison (noon if no time)
+)
+
 data class UiTimestamp(
     val raw: String,
+    val parsedDate: String?,   // "yyyy-MM-dd"
+    val parsedTime: String?,   // "HH:mm:ss" or null if label has no time
     val epochMs: Long?,
     val y: Int,
     val x: Int
 )
 
-private fun parseInstagramTimestampLabelToEpochMs(
+private fun parseInstagramGroupLabel(
     rawLabel: String,
     nowMs: Long = System.currentTimeMillis()
-): Long? {
+): ParsedGroupLabel? {
     val label = rawLabel.trim()
     if (label.isBlank()) return null
 
@@ -219,6 +208,8 @@ private fun parseInstagramTimestampLabelToEpochMs(
     if (lower.startsWith("seen") || lower.startsWith("active") || lower.contains("typing")) return null
 
     val nowCal = java.util.Calendar.getInstance().apply { timeInMillis = nowMs }
+    val dateFmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
+    val timeFmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
 
     fun calAtNoon(base: java.util.Calendar): java.util.Calendar {
         return (base.clone() as java.util.Calendar).apply {
@@ -230,7 +221,6 @@ private fun parseInstagramTimestampLabelToEpochMs(
     }
 
     fun tryParseTimeOnly(s: String): Pair<Int, Int>? {
-        // Handles: 13:45, 1:45 PM, 01:45am
         val t = s.trim()
         val m = Regex("""^(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?$""").find(t) ?: return null
         var hh = m.groupValues[1].toInt()
@@ -251,8 +241,15 @@ private fun parseInstagramTimestampLabelToEpochMs(
         }
     }
 
+    fun result(cal: java.util.Calendar, hasTime: Boolean): ParsedGroupLabel {
+        return ParsedGroupLabel(
+            date = dateFmt.format(cal.time),
+            time = if (hasTime) timeFmt.format(cal.time) else null,
+            epochMs = cal.timeInMillis
+        )
+    }
+
     fun dayOfWeekFromLabel(s: String): Int? {
-        // English short/long; extend if you need DE etc.
         val map = mapOf(
             "mon" to java.util.Calendar.MONDAY, "monday" to java.util.Calendar.MONDAY,
             "tue" to java.util.Calendar.TUESDAY, "tues" to java.util.Calendar.TUESDAY, "tuesday" to java.util.Calendar.TUESDAY,
@@ -262,13 +259,11 @@ private fun parseInstagramTimestampLabelToEpochMs(
             "sat" to java.util.Calendar.SATURDAY, "saturday" to java.util.Calendar.SATURDAY,
             "sun" to java.util.Calendar.SUNDAY, "sunday" to java.util.Calendar.SUNDAY
         )
-        val key = s.trim().lowercase()
-        return map[key]
+        return map[s.trim().lowercase()]
     }
 
     fun mostRecentDow(dow: Int, baseMs: Long): java.util.Calendar {
         val cal = java.util.Calendar.getInstance().apply { timeInMillis = baseMs }
-        // Walk back up to 7 days until we hit requested day-of-week
         for (i in 0..7) {
             if (cal.get(java.util.Calendar.DAY_OF_WEEK) == dow) return cal
             cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
@@ -276,39 +271,78 @@ private fun parseInstagramTimestampLabelToEpochMs(
         return cal
     }
 
-    // 1) Pure time: "13:45" / "1:45 PM"
-    tryParseTimeOnly(label)?.let { (hh, mm) ->
-        val today = (nowCal.clone() as java.util.Calendar).apply {
-            set(java.util.Calendar.SECOND, 0)
-            set(java.util.Calendar.MILLISECOND, 0)
+    fun monthFromName(s: String): Int? {
+        val map = mapOf(
+            "jan" to java.util.Calendar.JANUARY, "january" to java.util.Calendar.JANUARY,
+            "feb" to java.util.Calendar.FEBRUARY, "february" to java.util.Calendar.FEBRUARY,
+            "mar" to java.util.Calendar.MARCH, "march" to java.util.Calendar.MARCH,
+            "apr" to java.util.Calendar.APRIL, "april" to java.util.Calendar.APRIL,
+            "may" to java.util.Calendar.MAY,
+            "jun" to java.util.Calendar.JUNE, "june" to java.util.Calendar.JUNE,
+            "jul" to java.util.Calendar.JULY, "july" to java.util.Calendar.JULY,
+            "aug" to java.util.Calendar.AUGUST, "august" to java.util.Calendar.AUGUST,
+            "sep" to java.util.Calendar.SEPTEMBER, "sept" to java.util.Calendar.SEPTEMBER, "september" to java.util.Calendar.SEPTEMBER,
+            "oct" to java.util.Calendar.OCTOBER, "october" to java.util.Calendar.OCTOBER,
+            "nov" to java.util.Calendar.NOVEMBER, "november" to java.util.Calendar.NOVEMBER,
+            "dec" to java.util.Calendar.DECEMBER, "december" to java.util.Calendar.DECEMBER
+        )
+        return map[s.trim().lowercase()]
+    }
+
+    // Helper for year guessing: if date is in the future, use previous year
+    fun guessYear(cal: java.util.Calendar) {
+        if (cal.timeInMillis > nowMs) {
+            cal.set(java.util.Calendar.YEAR, cal.get(java.util.Calendar.YEAR) - 1)
         }
-        return setTime(today, hh, mm).timeInMillis
     }
 
-    // 2) Relative: "Yesterday"
+    // 1) Pure time: "13:45" / "1:45 PM" → today's date + exact time
+    tryParseTimeOnly(label)?.let { (hh, mm) ->
+        val cal = setTime(nowCal, hh, mm)
+        return result(cal, hasTime = true)
+    }
+
+    // 2) "Yesterday"
     if (lower == "yesterday") {
-        val y = calAtNoon(nowCal)
-        y.add(java.util.Calendar.DAY_OF_YEAR, -1)
-        return y.timeInMillis
+        val cal = calAtNoon(nowCal)
+        cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+        return result(cal, hasTime = false)
     }
 
-    // 3) Day-of-week only: "Mon"
-    dayOfWeekFromLabel(label)?.let { dow ->
-        val cal = mostRecentDow(dow, nowMs)
-        return calAtNoon(cal).timeInMillis
-    }
-
-    // 4) "Mon 12" (dow + day-of-month)
+    // 3) "Tue 14:45" / "Fri 21:06" (day-of-week + time, previous week messages)
     run {
-        val m = Regex("""^(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(\d{1,2})$""",
+        val m = Regex(
+            """^(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday),?\s*(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?$""",
             RegexOption.IGNORE_CASE
         ).find(label)
+        if (m != null) {
+            val dow = dayOfWeekFromLabel(m.groupValues[1]) ?: return@run
+            var hh = m.groupValues[2].toInt()
+            val mm = m.groupValues[3].toInt()
+            val ampm = m.groupValues.getOrNull(4)?.lowercase()?.trim().orEmpty()
+            if (ampm == "pm" && hh in 1..11) hh += 12
+            if (ampm == "am" && hh == 12) hh = 0
+            val cal = mostRecentDow(dow, nowMs)
+            val withTime = setTime(cal, hh, mm)
+            return result(withTime, hasTime = true)
+        }
+    }
 
+    // 4) Day-of-week only: "Mon" → date only, no time
+    dayOfWeekFromLabel(label)?.let { dow ->
+        val cal = mostRecentDow(dow, nowMs)
+        return result(calAtNoon(cal), hasTime = false)
+    }
+
+    // 5) "Mon 12" (dow + day-of-month)
+    run {
+        val m = Regex(
+            """^(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s+(\d{1,2})$""",
+            RegexOption.IGNORE_CASE
+        ).find(label)
         if (m != null) {
             val dow = dayOfWeekFromLabel(m.groupValues[1]) ?: return@run
             val dom = m.groupValues[2].toInt()
-
-            // Choose the most plausible date: start from current month, walk back up to 14 months.
             val probe = java.util.Calendar.getInstance().apply { timeInMillis = nowMs }
             for (i in 0..14) {
                 val c = (probe.clone() as java.util.Calendar).apply {
@@ -318,26 +352,119 @@ private fun parseInstagramTimestampLabelToEpochMs(
                     set(java.util.Calendar.SECOND, 0)
                     set(java.util.Calendar.MILLISECOND, 0)
                 }
-                // Ensure calendar didn't roll (invalid dom like Feb 30)
                 if (c.get(java.util.Calendar.DAY_OF_MONTH) == dom &&
                     c.get(java.util.Calendar.DAY_OF_WEEK) == dow &&
                     c.timeInMillis <= nowMs
                 ) {
-                    return c.timeInMillis
+                    return result(c, hasTime = false)
                 }
                 probe.add(java.util.Calendar.MONTH, -1)
             }
         }
     }
 
-    // 5) "Last year"
+    // 6) "Last year"
     if (lower == "last year") {
         val c = calAtNoon(nowCal)
         c.add(java.util.Calendar.YEAR, -1)
-        return c.timeInMillis
+        return result(c, hasTime = false)
     }
 
-    // 6) If we cannot parse: return null
+    // 7) "25 Dec 2020" (day month year) → date only
+    run {
+        val m = Regex("""^(\d{1,2})\s+(\w+)\s+(\d{4})$""").find(label)
+        if (m != null) {
+            val dom = m.groupValues[1].toInt()
+            val month = monthFromName(m.groupValues[2]) ?: return@run
+            val year = m.groupValues[3].toInt()
+            val c = java.util.Calendar.getInstance().apply {
+                set(java.util.Calendar.YEAR, year)
+                set(java.util.Calendar.MONTH, month)
+                set(java.util.Calendar.DAY_OF_MONTH, dom)
+                set(java.util.Calendar.HOUR_OF_DAY, 12)
+                set(java.util.Calendar.MINUTE, 0)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+            if (c.get(java.util.Calendar.DAY_OF_MONTH) == dom) {
+                return result(c, hasTime = false)
+            }
+        }
+    }
+
+    // 8) "30 Dec, 03:07" (day month, time - no year) → date + time
+    run {
+        val m = Regex("""^(\d{1,2})\s+(\w+),\s*(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?$""").find(label)
+        if (m != null) {
+            val dom = m.groupValues[1].toInt()
+            val month = monthFromName(m.groupValues[2]) ?: return@run
+            var hh = m.groupValues[3].toInt()
+            val mm = m.groupValues[4].toInt()
+            val ampm = m.groupValues.getOrNull(5)?.lowercase()?.trim().orEmpty()
+            if (ampm == "pm" && hh in 1..11) hh += 12
+            if (ampm == "am" && hh == 12) hh = 0
+            val currentYear = nowCal.get(java.util.Calendar.YEAR)
+            val c = java.util.Calendar.getInstance().apply {
+                set(java.util.Calendar.YEAR, currentYear)
+                set(java.util.Calendar.MONTH, month)
+                set(java.util.Calendar.DAY_OF_MONTH, dom)
+                set(java.util.Calendar.HOUR_OF_DAY, hh)
+                set(java.util.Calendar.MINUTE, mm)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+            if (c.get(java.util.Calendar.DAY_OF_MONTH) == dom) {
+                guessYear(c)
+                return result(c, hasTime = true)
+            }
+        }
+    }
+
+    // 9) "Dec 25, 2020" (US format: month day, year) → date only
+    run {
+        val m = Regex("""^(\w+)\s+(\d{1,2}),?\s+(\d{4})$""").find(label)
+        if (m != null) {
+            val month = monthFromName(m.groupValues[1]) ?: return@run
+            val dom = m.groupValues[2].toInt()
+            val year = m.groupValues[3].toInt()
+            val c = java.util.Calendar.getInstance().apply {
+                set(java.util.Calendar.YEAR, year)
+                set(java.util.Calendar.MONTH, month)
+                set(java.util.Calendar.DAY_OF_MONTH, dom)
+                set(java.util.Calendar.HOUR_OF_DAY, 12)
+                set(java.util.Calendar.MINUTE, 0)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+            if (c.get(java.util.Calendar.DAY_OF_MONTH) == dom) {
+                return result(c, hasTime = false)
+            }
+        }
+    }
+
+    // 10) "30 Dec" (day month, no year, no time) → date only
+    run {
+        val m = Regex("""^(\d{1,2})\s+(\w+)$""").find(label)
+        if (m != null) {
+            val dom = m.groupValues[1].toInt()
+            val month = monthFromName(m.groupValues[2]) ?: return@run
+            val currentYear = nowCal.get(java.util.Calendar.YEAR)
+            val c = java.util.Calendar.getInstance().apply {
+                set(java.util.Calendar.YEAR, currentYear)
+                set(java.util.Calendar.MONTH, month)
+                set(java.util.Calendar.DAY_OF_MONTH, dom)
+                set(java.util.Calendar.HOUR_OF_DAY, 12)
+                set(java.util.Calendar.MINUTE, 0)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+            if (c.get(java.util.Calendar.DAY_OF_MONTH) == dom) {
+                guessYear(c)
+                return result(c, hasTime = false)
+            }
+        }
+    }
+
     return null
 }
 
@@ -352,12 +479,24 @@ private fun collectUiTimestamps(rootNode: AccessibilityNodeInfo): List<UiTimesta
         // Avoid common non-timestamp UI strings
         if (lower.startsWith("seen") || lower.contains("type a message") || lower == "messages") return false
 
+        val dowNames = "mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+        val monthNames = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
+
         return Regex("""^\d{1,2}:\d{2}(\s*[AaPp][Mm])?$""").matches(s) ||  // 13:45, 1:45 PM
                 lower == "yesterday" ||
                 lower == "last year" ||
-                Regex("""^(mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)(\s+\d{1,2})?$""",
-                    RegexOption.IGNORE_CASE
-                ).matches(s)
+                // "Mon", "Mon 12" (dow only or dow + day-of-month)
+                Regex("""^($dowNames)(\s+\d{1,2})?$""", RegexOption.IGNORE_CASE).matches(s) ||
+                // "Tue 14:45", "Fri 21:06" (dow + time, previous week)
+                Regex("""^($dowNames),?\s*\d{1,2}:\d{2}(\s*[AaPp][Mm])?$""", RegexOption.IGNORE_CASE).matches(s) ||
+                // "25 Dec 2020" (day month year)
+                Regex("""^\d{1,2}\s+($monthNames)\w*\s+\d{4}$""", RegexOption.IGNORE_CASE).matches(s) ||
+                // "30 Dec, 03:07" (day month, time)
+                Regex("""^\d{1,2}\s+($monthNames)\w*,\s*\d{1,2}:\d{2}(\s*[AaPp][Mm])?$""", RegexOption.IGNORE_CASE).matches(s) ||
+                // "Dec 25, 2020" (month day, year - US format)
+                Regex("""^($monthNames)\w*\s+\d{1,2},?\s+\d{4}$""", RegexOption.IGNORE_CASE).matches(s) ||
+                // "30 Dec" (day month, no year, no time)
+                Regex("""^\d{1,2}\s+($monthNames)\w*$""", RegexOption.IGNORE_CASE).matches(s)
     }
 
     fun walk(n: AccessibilityNodeInfo, depth: Int = 0) {
@@ -376,8 +515,15 @@ private fun collectUiTimestamps(rootNode: AccessibilityNodeInfo): List<UiTimesta
         if (maybeTimestamp) {
             val bounds = android.graphics.Rect()
             n.getBoundsInScreen(bounds)
-            val epoch = parseInstagramTimestampLabelToEpochMs(text)
-            out.add(UiTimestamp(raw = text, epochMs = epoch, y = bounds.centerY(), x = bounds.centerX()))
+            val parsed = parseInstagramGroupLabel(text)
+            out.add(UiTimestamp(
+                raw = text,
+                parsedDate = parsed?.date,
+                parsedTime = parsed?.time,
+                epochMs = parsed?.epochMs,
+                y = bounds.centerY(),
+                x = bounds.centerX()
+            ))
         }
 
         for (i in 0 until n.childCount) {
@@ -392,38 +538,34 @@ private fun collectUiTimestamps(rootNode: AccessibilityNodeInfo): List<UiTimesta
     return out
 }
 
-private fun pickBestTimestampForMessage(
+// Returns the best matching group label ABOVE this message, or null if none found
+private fun pickBestGroupLabel(
     messageBounds: android.graphics.Rect,
     uiTimestamps: List<UiTimestamp>
-): Long? {
+): UiTimestamp? {
     if (uiTimestamps.isEmpty()) return null
 
     val msgY = messageBounds.centerY()
-    val msgX = messageBounds.centerX()
 
-    // Heuristic: closest by vertical distance, small horizontal penalty
-    val best = uiTimestamps.minByOrNull { ts ->
-        val dy = kotlin.math.abs(ts.y - msgY)
-        val dx = kotlin.math.abs(ts.x - msgX)
-        dy * 10 + dx
-    }
-
-    return best?.epochMs
+    // Find the nearest timestamp label that is ABOVE this message
+    // NEVER use a label BELOW - that belongs to a later group
+    return uiTimestamps
+        .filter { it.y < msgY && it.parsedDate != null }
+        .maxByOrNull { it.y }
 }
 
 
 private fun extractMessageData(messageNode: AccessibilityNodeInfo): MessageData {
     var messageText: String? = null
-    var replyText: String? = null
     var isGift = 0
-    
+
     // Extract main message text
     messageText = extractMessageText(messageNode)
-    
+
     // Check for gift indicators
     val contentDesc = messageNode.contentDescription?.toString() ?: ""
     val viewId = messageNode.viewIdResourceName ?: ""
-    
+
     if (contentDesc.contains("gift", ignoreCase = true) ||
         contentDesc.contains("sent a gift", ignoreCase = true) ||
         viewId.contains("gift", ignoreCase = true) ||
@@ -433,93 +575,8 @@ private fun extractMessageData(messageNode: AccessibilityNodeInfo): MessageData 
             messageText = null // Explicitly null for gifts without text
         }
     }
-    
-    // Look for reply context in parent/sibling nodes
-    replyText = findReplyContext(messageNode)
-    
-    return MessageData(messageText, isGift, replyText)
-}
 
-private fun findReplyContext(messageNode: AccessibilityNodeInfo): String? {
-    try {
-        // Check the message node's parent hierarchy for reply indicators
-        var currentNode: AccessibilityNodeInfo? = messageNode.parent
-        var depth = 0
-        val maxDepth = 5
-        
-        while (currentNode != null && depth < maxDepth) {
-            // Look for reply container
-            val viewId = currentNode.viewIdResourceName ?: ""
-            val contentDesc = currentNode.contentDescription?.toString() ?: ""
-            
-            if (viewId.contains("reply", ignoreCase = true) ||
-                contentDesc.contains("replying to", ignoreCase = true) ||
-                contentDesc.contains("replied to", ignoreCase = true)) {
-                
-                // Search children for the original message text
-                val replyText = findReplyTextInNode(currentNode)
-                if (replyText != null) {
-                    currentNode.recycle()
-                    return replyText
-                }
-            }
-            
-            val parent = currentNode.parent
-            currentNode.recycle()
-            currentNode = parent
-            depth++
-        }
-        
-        currentNode?.recycle()
-        
-        // Also check siblings for reply preview
-        val parentNode = messageNode.parent
-        if (parentNode != null) {
-            for (i in 0 until parentNode.childCount) {
-                val sibling = parentNode.getChild(i)
-                if (sibling != null) {
-                    val siblingViewId = sibling.viewIdResourceName ?: ""
-                    if (siblingViewId.contains("reply", ignoreCase = true) ||
-                        siblingViewId.contains("quoted", ignoreCase = true)) {
-                        val replyText = findReplyTextInNode(sibling)
-                        sibling.recycle()
-                        if (replyText != null) {
-                            parentNode.recycle()
-                            return replyText
-                        }
-                    }
-                    sibling.recycle()
-                }
-            }
-            parentNode.recycle()
-        }
-        
-    } catch (e: Exception) {
-        Log.e(TAG, "Error finding reply context: ${e.message}")
-    }
-    
-    return null
-}
-
-private fun findReplyTextInNode(node: AccessibilityNodeInfo): String? {
-    // Search this node and immediate children for reply text
-    val text = node.text?.toString()?.trim()
-    if (!text.isNullOrBlank() && text.length in 1..200) {
-        return text
-    }
-    
-    for (i in 0 until node.childCount) {
-        val child = node.getChild(i)
-        if (child != null) {
-            val childText = child.text?.toString()?.trim()
-            child.recycle()
-            if (!childText.isNullOrBlank() && childText.length in 1..200) {
-                return childText
-            }
-        }
-    }
-    
-    return null
+    return MessageData(messageText, isGift)
 }
 
     private fun handleWindowChange(className: String) {
@@ -592,10 +649,10 @@ private fun findReplyTextInNode(node: AccessibilityNodeInfo): String? {
             if (isInDirectMessages) {
                 isInDirectMessages = false
                 currentChatContact = null
-                textMessageCache.clear()
-                mediaContentCache.clear()
-                pendingReplyContext = null
-                recentMessagesForReplyInference.clear()
+                mediaSavedCounts.clear()
+                prevVisibleMediaCounts.clear()
+                mediaCalibrated = false
+                savedTextFingerprints.clear()
             }
         }
     }
@@ -752,7 +809,9 @@ fun exportDataToFile() {
                         val direction = if (msg.isSentByUser) "SENT" else "RECEIVED"
                         val assetLabel = msg.assetType.uppercase()
                         val content = if (msg.assetType == AssetType.TEXT) msg.messageText else "[${msg.assetType}]"
-                        out.println("  [${msg.readableTime}] [$direction] [$assetLabel] $content")
+                        val timeStr = msg.readableTime
+                        val refStr = if (msg.groupLabelMessageId != null) " ref=#${msg.groupLabelMessageId}" else ""
+                        out.println("  [${timeStr}] [$direction] [$assetLabel] $content$refStr")
                     }
                 }
             }
@@ -781,11 +840,22 @@ fun exportDataToFile() {
             if (contactName != null && contactName != currentChatContact) {
                 Log.d(TAG, "📱 OPENED CHAT WITH: '$contactName'")
                 currentChatContact = contactName
-                // Clear caches for this new chat
-                textMessageCache.clear()
-                mediaContentCache.clear()
-                pendingReplyContext = null
-                recentMessagesForReplyInference.clear()
+
+                // Initialize media saved counts from DB for this contact
+                mediaSavedCounts.clear()
+                prevVisibleMediaCounts.clear()
+                mediaCalibrated = false
+                savedTextFingerprints.clear()
+                try {
+                    val counts = messageDao.getMediaCounts(contactName)
+                    counts.forEach { mc ->
+                        val key = "$contactName|${mc.assetType}|${mc.isSentByUser}"
+                        mediaSavedCounts[key] = mc.cnt
+                    }
+                    Log.d(TAG, "📊 Media counts from DB: $mediaSavedCounts")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error loading media counts: ${e.message}")
+                }
 
                 // Save contact if not already saved
                 saveContact(contactName)
@@ -832,21 +902,20 @@ private fun buildFingerprint(
     isSentByUser: Boolean,
     messageText: String?,
     detectedDesc: String?,
-    replyMessageID: Long?
+    ordinal: Int
 ): String {
     val base = when (assetType) {
         AssetType.TEXT -> "t|$isSentByUser|${messageText.orEmpty().trim()}"
         else -> {
-            // media fingerprint should NOT use bounds (bounds change when you reopen/scroll)
             val d = normalizeDesc(detectedDesc.orEmpty())
             "m|$assetType|$isSentByUser|$d"
         }
     }
 
-    // Include reply id if available so same text can exist once as reply and once normal (optional)
-    val replyPart = replyMessageID?.let { "|r:$it" } ?: ""
-
-    return sha256("$contactName|$base$replyPart")
+    // Ordinal = position among same-content messages on screen (stable across rescans)
+    // This ensures two "Hi" messages get different fingerprints (ordinal 0, ordinal 1)
+    // while the same "Hi" always gets the same fingerprint on every scan
+    return sha256("$contactName|$base|$ordinal")
 }
 
 private suspend fun captureNewMessages() {
@@ -854,278 +923,239 @@ private suspend fun captureNewMessages() {
         val rootNode = rootInActiveWindow ?: return
         val contactName = currentChatContact ?: "Unknown"
 
-            // Detect and store reply context if present
-            detectAndStoreReplyContext(rootNode, contactName)
+        val detectedMessages = findMessageNodes(rootNode)
 
-            // Find all message nodes (text and media)
-            val detectedMessages = findMessageNodes(rootNode)
-            var newMessageCount = 0
+        if (detectedMessages.isEmpty()) {
+            rootNode.recycle()
+            return
+        }
 
-            if (ULTRA_DEEP_LOGGING) {
-                Log.d(TAG, "╔════════════════════════════════════════════╗")
-                Log.d(TAG, "║ SCAN SUMMARY                               ║")
-                Log.d(TAG, "╚════════════════════════════════════════════╝")
-                Log.d(TAG, "  Contact: $contactName")
-                Log.d(TAG, "  Detected messages: ${detectedMessages.size}")
-                detectedMessages.forEachIndexed { index, msg ->
-                    Log.d(TAG, "    ${index + 1}. [${ msg.assetType}] '${msg.text.take(30)}'")
+        if (ULTRA_DEEP_LOGGING) {
+            Log.d(TAG, "╔════════════════════════════════════════════╗")
+            Log.d(TAG, "║ SCAN SUMMARY                               ║")
+            Log.d(TAG, "╚════════════════════════════════════════════╝")
+            Log.d(TAG, "  Contact: $contactName")
+            Log.d(TAG, "  Detected messages: ${detectedMessages.size}")
+            detectedMessages.forEachIndexed { index, msg ->
+                Log.d(TAG, "    ${index + 1}. [${msg.assetType}] '${msg.text.take(30)}'")
+            }
+        }
+
+        val uiTimestamps = collectUiTimestamps(rootNode)
+
+        if (ULTRA_DEEP_LOGGING) {
+            Log.d(TAG, "⏱️ UI TIMESTAMPS FOUND: ${uiTimestamps.size}")
+            uiTimestamps.take(10).forEach { ts ->
+                Log.d(TAG, "   - '${ts.raw}' -> ${ts.epochMs ?: "unparsed"} (x=${ts.x}, y=${ts.y})")
+            }
+
+        }
+
+        // === HYBRID DEDUP ===
+        // TEXT: Ordinal-based fingerprints (content naturally distinguishes messages)
+        // MEDIA: Count-based dedup (all images look the same, so count visible vs saved)
+
+        data class MsgInfo(
+            val detected: DetectedMessage,
+            val isSentByUser: Boolean,
+            val messageText: String,
+            val assetType: String,
+            val screenY: Int,
+            val fingerprintBase: String
+        )
+
+        val msgInfos = mutableListOf<MsgInfo>()
+
+        detectedMessages.forEach { detected ->
+            val assetType = detected.assetType
+
+            if (assetType == AssetType.TEXT && detected.text.isBlank()) {
+                detected.node.recycle()
+                return@forEach
+            }
+
+            val isSentByUser = isMessageSentByUser(detected.node)
+            val messageText = when (assetType) {
+                AssetType.TEXT -> detected.text
+                else -> ""
+            }
+
+            val bounds = android.graphics.Rect()
+            detected.node.getBoundsInScreen(bounds)
+
+            val fpBase = when (assetType) {
+                AssetType.TEXT -> "t|$isSentByUser|${messageText.trim()}"
+                else -> {
+                    val d = normalizeDesc(detected.text.orEmpty())
+                    "m|$assetType|$isSentByUser|$d"
                 }
             }
 
-            // DEBUG: If no messages found, dump UI tree to help troubleshoot
-            // if (detectedMessages.isEmpty()) {
-            //     Log.w(TAG, "⚠️ No messages found in UI tree. Dumping UI structure for debugging...")
-            //     dumpUITree(rootNode, maxDepth = 8)
-            // }
+            msgInfos.add(MsgInfo(detected, isSentByUser, messageText, assetType, bounds.centerY(), fpBase))
+        }
 
-            val currentTime = System.currentTimeMillis()
-            val uiTimestamps = collectUiTimestamps(rootNode)
+        var newMessageCount = 0
+        val dateFmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
 
-            if (ULTRA_DEEP_LOGGING) {
-                Log.d(TAG, "⏱️ UI TIMESTAMPS FOUND: ${uiTimestamps.size}")
-                uiTimestamps.take(10).forEach { ts ->
-                    Log.d(TAG, "   - '${ts.raw}' -> ${ts.epochMs ?: "unparsed"} (x=${ts.x}, y=${ts.y})")
-                }
-            }
-            // Clean up old entries from caches (keep only last 60 seconds)
-            val cacheCleanupThreshold = currentTime - maxOf(
-                SENT_MESSAGE_DUPLICATE_WINDOW_MS,
-                RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS
-            )
-            textMessageCache.entries.removeIf { it.value < cacheCleanupThreshold }
-            mediaContentCache.entries.removeIf { it.value < cacheCleanupThreshold }
-            // Process each detected message
-            detectedMessages.forEach { detected ->
-                val assetType = detected.assetType
+        // Helper to insert a message with proper date/time/groupLabelMessageId
+        // Uses DB lookups instead of screen-position to determine "first in group",
+        // so scrolling doesn't break groupLabelMessageId assignment.
+        suspend fun insertWithGroupLabel(
+            mi: MsgInfo,
+            fp: String,
+            logTag: String,
+            ordinal: Int? = null
+        ): Long {
+            val bounds = android.graphics.Rect()
+            mi.detected.node.getBoundsInScreen(bounds)
+            val label = pickBestGroupLabel(bounds, uiTimestamps)
 
-                // Determine if message is sent by user (needed for deduplication and storage)
-                val isSentByUser = isMessageSentByUser(detected.node)
+            val msgDate: String?
+            val msgTime: String?
+            var msgGroupLabelId: Long? = null
 
-                // For text messages: store the actual text in messageText
-                // For media messages: store EMPTY string in messageText (user requirement)
-                val messageText = when (assetType) {
-                        AssetType.TEXT -> detected.text
+            if (label != null && label.parsedDate != null) {
+                msgDate = label.parsedDate
 
-                        else -> ""                          // other media stays empty
-                    }
-
-                if (assetType == AssetType.TEXT && detected.text.isBlank()) {
-                    // Skip blank text messages
-                    detected.node.recycle()
-                    return@forEach
-                }
-
-                var shouldSave = false
-                val direction = if (isSentByUser) "SENT" else "RECEIVED"
-
-                if (ULTRA_DEEP_LOGGING) {
-                    Log.d(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                    Log.d(TAG, "🔍 PROCESSING MESSAGE:")
-                    Log.d(TAG, "  Text: '${detected.text.take(50)}'")
-                    Log.d(TAG, "  Type: $assetType")
-                    Log.d(TAG, "  Direction: $direction")
-                }
-
-                if (assetType == AssetType.TEXT) {
-                    // For text: use time-based deduplication
-                    // IMPORTANT: Include isSentByUser to distinguish between:
-                    // - "Hi" sent by friend
-                    // - "Hi" sent by user
-                    // Use longer window for RECEIVED messages (they shouldn't duplicate)
-                    // Use shorter window for SENT messages (you might send same text again)
-                    val textKey = "$contactName-${detected.text}-$isSentByUser"
-                    val lastSeenTime = textMessageCache[textKey]
-                    val duplicateWindow = if (isSentByUser) {
-                        SENT_MESSAGE_DUPLICATE_WINDOW_MS
+                if (label.parsedTime != null) {
+                    // Label has time (e.g. "9 Feb, 21:06", "Tue 14:45")
+                    // Check DB: is there already a first message for this date+time?
+                    val existingFirstId = messageDao.getFirstMessageIdByDateAndTime(
+                        contactName, msgDate, label.parsedTime
+                    )
+                    if (existingFirstId == null) {
+                        // No first message yet → this IS the first, gets the time
+                        msgTime = label.parsedTime
+                        msgGroupLabelId = null
                     } else {
-                        RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS
-                    }
-
-                    if (ULTRA_DEEP_LOGGING) {
-                        Log.d(TAG, "  Deduplication key: '$textKey'")
-                        Log.d(TAG, "  Last seen: ${if (lastSeenTime != null) "${currentTime - lastSeenTime}ms ago" else "never"}")
-                        Log.d(TAG, "  Window: ${duplicateWindow}ms (${if (isSentByUser) "SENT" else "RECEIVED"})")
-                    }
-
-                    if (lastSeenTime == null || (currentTime - lastSeenTime) > duplicateWindow) {
-                        // Either never seen before, or seen long ago → safe to save
-                        shouldSave = true
-                        textMessageCache[textKey] = currentTime
-                        if (ULTRA_DEEP_LOGGING) {
-                            Log.d(TAG, "  ✅ DECISION: SAVE (${if (lastSeenTime == null) "first time" else "outside window"})")
-                        }
-                    } else {
-                        // Seen recently → likely scroll duplicate, skip
-                        Log.d(TAG, "  ⏭️ DECISION: SKIP - seen ${currentTime - lastSeenTime}ms ago (within ${duplicateWindow}ms window)")
+                        // First message already exists → point to it, no time
+                        msgTime = null
+                        msgGroupLabelId = existingFirstId
                     }
                 } else {
-                    // For media: use content description to uniquely identify each media item
-                    // This allows us to:
-                    // - Skip the SAME media when detected again due to scrolling
-                    // - Save DIFFERENT media even if sent close together
-                    val bounds = android.graphics.Rect()
-detected.node.getBoundsInScreen(bounds)
-
-// Normalize content description (Instagram often repeats the same string or includes usernames)
-val rawDesc = detected.text.orEmpty().trim()
-val normalizedDesc = rawDesc
-    .lowercase()
-    .replace(Regex("\\s+"), " ")
-    .replace(Regex("^.+? sent (a|an) "), "sent ")
-
-val mediaKey = if (normalizedDesc.isNotBlank()) {
-    "$contactName-$assetType-$isSentByUser-$normalizedDesc"
-} else {
-    // If desc is empty, DON'T try to dedupe here by bounds; let DB fingerprint handle it
-    "$contactName-$assetType-$isSentByUser-no_desc"
-}
-
-val lastSeenTime = mediaContentCache[mediaKey]
-if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPLICATE_WINDOW_MS) {
-    shouldSave = true
-    mediaContentCache[mediaKey] = currentTime
-} else {
-    Log.d(TAG, "⏭️ SKIP [$assetType] duplicate ${currentTime - lastSeenTime}ms ago key='$mediaKey'")
-}
-}
-
-                if (shouldSave) {
-                    val boundsForTs = android.graphics.Rect()
-                    detected.node.getBoundsInScreen(boundsForTs)
-
-                    val parsedTs = pickBestTimestampForMessage(boundsForTs, uiTimestamps)
-                    val timestamp = parsedTs ?: System.currentTimeMillis()
-
-                    if (ULTRA_DEEP_LOGGING && parsedTs != null) {
-                        Log.d(TAG, "⏱️ USING CHAT TIMESTAMP: $parsedTs for '${detected.text.take(40)}'")
-                    } else if (ULTRA_DEEP_LOGGING && parsedTs == null) {
-                        Log.d(TAG, "⏱️ FALLBACK TIMESTAMP (system) for '${detected.text.take(40)}'")
-                    }
-
-                    // Get Y position of this message for reply inference
-                    val bounds = android.graphics.Rect()
-                    detected.node.getBoundsInScreen(bounds)
-                    val messageYPosition = bounds.top
-
-                    // Determine reply context based on message direction
-                    var replyMessage: String? = null
-                    var replyMessageID: Long? = null
-
-                    if (isSentByUser) {
-                        // For SENT messages: use the global reply context from compose area
-                        if (pendingReplyContext != null) {
-                            replyMessage = pendingReplyContext!!.first
-                            replyMessageID = pendingReplyContext!!.second
-                            Log.d(TAG, "  💬 APPLYING REPLY CONTEXT (SENT): '$replyMessage' (ID: $replyMessageID)")
-                            // DON'T clear the context after using it - allow multiple messages to reply to the same message
-                            // Context will expire naturally after REPLY_CONTEXT_TIMEOUT_MS (60s)
-                        } else if (ULTRA_DEEP_LOGGING) {
-                            Log.d(TAG, "  ℹ️ No pending reply context")
-                        }
+                    // Label has no time (e.g. "24 Dec 2020", "Yesterday")
+                    // Check DB: is there already any message for this date?
+                    val existingFirstId = messageDao.getFirstMessageIdByDate(contactName, msgDate)
+                    if (existingFirstId == null) {
+                        // No message yet → this IS the first for this date
+                        msgTime = null
+                        msgGroupLabelId = null
                     } else {
-                        // For RECEIVED messages: try multiple methods to detect replies
-
-                        // Method 1: Check if the message bubble contained a quoted message (Instagram's native reply UI)
-                        if (detected.quotedMessageText != null) {
-                            if (ULTRA_DEEP_LOGGING) {
-                                Log.d(TAG, "  🔍 RECEIVED message has quoted text: '${detected.quotedMessageText}'")
-                            }
-                            // Look up the original message in database
-                            val originalMessage = messageDao.findMessageByText(contactName, detected.quotedMessageText)
-                            if (originalMessage != null) {
-                                replyMessage = detected.quotedMessageText
-                                replyMessageID = originalMessage.id
-                                Log.d(TAG, "  💬 APPLYING REPLY CONTEXT (RECEIVED - Native UI): '$replyMessage' (ID: $replyMessageID)")
-                            } else if (ULTRA_DEEP_LOGGING) {
-                                Log.d(TAG, "  ⚠️ Quoted message not found in DB: '${detected.quotedMessageText}'")
-                            }
-                        }
-
-                        // Method 2: If no quoted text found, try position-based inference
-                        if (replyMessage == null) {
-                            val inferredReply = inferReplyFromPosition(messageYPosition, timestamp, contactName)
-                            if (inferredReply != null) {
-                                replyMessage = inferredReply.first
-                                replyMessageID = inferredReply.second
-                                Log.d(TAG, "  💬 APPLYING REPLY CONTEXT (RECEIVED - Position Inference): '$replyMessage' (ID: $replyMessageID)")
-                            }
-                        }
-                    }
-
-                        val fp = buildFingerprint(
-                            contactName = contactName,
-                            assetType = assetType,
-                            isSentByUser = isSentByUser,
-                            messageText = messageText,
-                            detectedDesc = if (assetType == AssetType.TEXT) null else detected.text,
-                            replyMessageID = replyMessageID
-                        )
-
-                        // ✅ hard DB dedupe (persists forever)
-                        val existingId = messageDao.getExistingIdByFingerprint(contactName, fp)
-                        if (existingId != null) {
-                            Log.d(TAG, "⏭️ SKIP (DB duplicate) [$assetType] existingId=$existingId fp=$fp")
-                            detected.node.recycle()
-                            return@forEach
-                        }
-                    val epochMs = timestamp 
-                    val sdf = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.getDefault())
-                    val timestampReadable = sdf.format(java.util.Date(epochMs))
-                    val message = Message(
-                        id = 0,
-                        contactName = contactName,
-                        messageText = messageText,  // Empty for media, actual text for text messages
-                        timestamp = timestampReadable,
-                        isSentByUser = isSentByUser,
-                        assetType = assetType,
-                        replyMessage = replyMessage,
-                        replyMessageID = replyMessageID,
-                        fingerprint = fp
-                    )
-
-                    if (ULTRA_DEEP_LOGGING) {
-                        Log.d(TAG, "  💾 SAVING TO DATABASE:")
-                        Log.d(TAG, "    contactName: $contactName")
-                        Log.d(TAG, "    messageText: '${messageText.take(50)}'")
-                        Log.d(TAG, "    assetType: $assetType")
-                        Log.d(TAG, "    isSentByUser: $isSentByUser")
-                        Log.d(TAG, "    replyMessage: ${replyMessage ?: "null"}")
-                        Log.d(TAG, "    replyMessageID: ${replyMessageID ?: "null"}")
-                        Log.d(TAG, "    fingerprint: $fp")
-                    }
-
-                    val messageId = messageDao.insert(message)
-                    newMessageCount++
-
-                    val preview = if (assetType == AssetType.TEXT) messageText.take(50) else detected.text.take(50)
-                    val replyInfo = if (replyMessageID != null) " [REPLY TO: $replyMessageID]" else ""
-                    Log.d(TAG, "  ✅ SAVED [$assetType] [$direction]: '$preview' (DB ID: $messageId)$replyInfo")
-
-                    // Store this message for position-based reply inference
-                    // Only store text messages (media messages don't typically get replied to by text)
-                    if (assetType == AssetType.TEXT && messageText.isNotBlank()) {
-                        recentMessagesForReplyInference.add(
-                            RecentMessageInfo(
-                                messageText = messageText,
-                                messageId = messageId,
-                                timestamp = timestamp,
-                                yPosition = messageYPosition,
-                                isSentByUser = isSentByUser
-                            )
-                        )
-                        if (ULTRA_DEEP_LOGGING) {
-                            Log.d(TAG, "  📌 Stored for reply inference: Y=$messageYPosition, sent=$isSentByUser")
-                        }
-                    }
-
-                    if (ULTRA_DEEP_LOGGING) {
-                        Log.d(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+                        // First message already exists → point to it
+                        msgTime = null
+                        msgGroupLabelId = existingFirstId
                     }
                 }
-
-                // Recycle the node after use
-                detected.node.recycle()
+            } else {
+                // No group label above (scrolled off) → use today's date as fallback
+                msgDate = dateFmt.format(java.util.Date())
+                msgTime = null
+                // Still check DB: if there's already a message for this date, point to it
+                val existingFirstId = messageDao.getFirstMessageIdByDate(contactName, msgDate)
+                if (existingFirstId != null) {
+                    msgGroupLabelId = existingFirstId
+                }
             }
+
+            val message = Message(
+                id = 0, contactName = contactName, messageText = mi.messageText,
+                date = msgDate, time = msgTime, groupLabelMessageId = msgGroupLabelId,
+                isSentByUser = mi.isSentByUser,
+                assetType = mi.assetType, fingerprint = fp
+            )
+
+            val messageId = messageDao.insert(message)
+            if (messageId != -1L) {
+                newMessageCount++
+                val direction = if (mi.isSentByUser) "SENT" else "RECEIVED"
+                val ordStr = if (ordinal != null) ", ordinal: $ordinal" else ""
+                Log.d(TAG, "  ✅ SAVED [$logTag] [$direction]: '${mi.detected.text.take(50)}' (ID: $messageId$ordStr, date=$msgDate, time=$msgTime, groupRef=$msgGroupLabelId)")
+            }
+            return messageId
+        }
+
+        // ---- TEXT MESSAGES: ordinal-based fingerprints ----
+        val textMsgs = msgInfos.filter { it.assetType == AssetType.TEXT }
+        textMsgs.forEach { mi ->
+            val ordinal = textMsgs.count { other ->
+                other.fingerprintBase == mi.fingerprintBase &&
+                other.screenY < mi.screenY
+            }
+
+            val fp = buildFingerprint(contactName, mi.assetType, mi.isSentByUser,
+                mi.messageText, null, ordinal)
+
+            // Skip DB insert if we already know this fingerprint was saved
+            if (fp in savedTextFingerprints) {
+                mi.detected.node.recycle()
+                return@forEach
+            }
+
+            insertWithGroupLabel(mi, fp, "text", ordinal)
+            savedTextFingerprints.add(fp)
+            mi.detected.node.recycle()
+        }
+
+        // ---- MEDIA MESSAGES: count-based dedup ----
+        val mediaMsgs = msgInfos.filter { it.assetType != AssetType.TEXT }
+        val mediaGroups = mediaMsgs.groupBy { "$contactName|${it.assetType}|${it.isSentByUser}" }
+
+        mediaGroups.forEach { (groupKey, group) ->
+            val sorted = group.sortedBy { it.screenY }
+            val currentVisible = sorted.size
+            val savedCount = mediaSavedCounts.getOrDefault(groupKey, 0)
+
+            val newCount: Int
+            if (!mediaCalibrated) {
+                newCount = maxOf(0, currentVisible - savedCount)
+            } else {
+                // Use max(prevVisible, savedCount) to prevent scroll duplicates:
+                // During scroll, media can temporarily disappear (prevVisible drops to 0),
+                // then reappear and get falsely counted as "new". savedCount acts as a
+                // floor so we never save more than truly new media.
+                val prevVisible = prevVisibleMediaCounts.getOrDefault(groupKey, 0)
+                val baseline = maxOf(prevVisible, savedCount)
+                newCount = maxOf(0, currentVisible - baseline)
+            }
+
+            prevVisibleMediaCounts[groupKey] = currentVisible
+
+            if (ULTRA_DEEP_LOGGING) {
+                val prevVis = if (mediaCalibrated) prevVisibleMediaCounts.getOrDefault(groupKey, 0).toString() else "N/A(first)"
+                Log.d(TAG, "📊 MEDIA GROUP '$groupKey': visible=$currentVisible saved=$savedCount prevVisible=$prevVis new=$newCount calibrated=$mediaCalibrated")
+            }
+
+            if (newCount > 0) {
+                val newMsgs = sorted.takeLast(newCount)
+                newMsgs.forEachIndexed { index, mi ->
+                    val ordinal = savedCount + index
+                    val fp = buildFingerprint(contactName, mi.assetType, mi.isSentByUser,
+                        mi.messageText, mi.detected.text, ordinal)
+                    insertWithGroupLabel(mi, fp, mi.assetType, ordinal)
+                }
+                mediaSavedCounts[groupKey] = savedCount + newCount
+            }
+
+            sorted.forEach { it.detected.node.recycle() }
+        }
+
+        // Reset prevVisible to 0 for media types no longer visible on screen
+        val visibleGroupKeys = mediaGroups.keys
+        val staleKeys = prevVisibleMediaCounts.keys.filter { it !in visibleGroupKeys }
+        staleKeys.forEach { key ->
+            if (ULTRA_DEEP_LOGGING && prevVisibleMediaCounts[key] != 0) {
+                Log.d(TAG, "📊 MEDIA GROUP '$key' no longer visible, resetting prevVisible from ${prevVisibleMediaCounts[key]} to 0")
+            }
+            prevVisibleMediaCounts[key] = 0
+        }
+
+        if (mediaMsgs.isNotEmpty() || mediaCalibrated) {
+            mediaCalibrated = true
+        }
+
+        if (newMessageCount > 0) {
+            Log.d(TAG, "📨 Saved $newMessageCount new messages for '$contactName'")
+        }
 
         rootNode.recycle()
     } catch (e: Exception) {
@@ -1348,235 +1378,6 @@ if (lastSeenTime == null || (currentTime - lastSeenTime) > RECEIVED_MESSAGE_DUPL
     }
 }
 
-    /**
-     * Detects if user is replying to a message by checking for the reply bar.
-     * Looks up the original message in the database and stores the reply context.
-     */
-    private suspend fun detectAndStoreReplyContext(rootNode: AccessibilityNodeInfo, contactName: String) {
-        var quotedMessageText: String? = null
-
-        fun searchForQuotedMessage(node: AccessibilityNodeInfo) {
-            val viewId = node.viewIdResourceName ?: ""
-            val viewIdShort = viewId.substringAfterLast('/')?.substringAfterLast(':') ?: ""
-
-            // Look for the quoted_message_subtitle which contains the replied-to message text
-            if (viewIdShort.equals("quoted_message_subtitle", ignoreCase = true)) {
-                val text = node.text?.toString()
-                if (!text.isNullOrBlank()) {
-                    quotedMessageText = text
-                    return  // Found it, stop searching
-                }
-            }
-
-            // Recursively search children
-            for (i in 0 until node.childCount) {
-                if (quotedMessageText != null) return  // Already found, stop
-                node.getChild(i)?.let { child ->
-                    searchForQuotedMessage(child)
-                    child.recycle()
-                }
-            }
-        }
-
-        searchForQuotedMessage(rootNode)
-
-        val currentTime = System.currentTimeMillis()
-
-        if (ULTRA_DEEP_LOGGING) {
-            Log.d(TAG, "╔════════════════════════════════════════════╗")
-            Log.d(TAG, "║ REPLY CONTEXT DETECTION                    ║")
-            Log.d(TAG, "╚════════════════════════════════════════════╝")
-            Log.d(TAG, "  Quoted message found: ${quotedMessageText ?: "none"}")
-            Log.d(TAG, "  Current pending context: ${pendingReplyContext?.let { "'${it.first}' (ID: ${it.second}, age: ${currentTime - it.third}ms)" } ?: "none"}")
-        }
-
-        // If reply bar found, look up the original message and store context with timestamp
-        if (!quotedMessageText.isNullOrBlank()) {
-            val originalMessage = messageDao.findMessageByText(contactName, quotedMessageText)
-            if (ULTRA_DEEP_LOGGING) {
-                Log.d(TAG, "  DB lookup for '$quotedMessageText': ${if (originalMessage != null) "FOUND (ID: ${originalMessage.id})" else "NOT FOUND"}")
-            }
-
-            if (originalMessage != null) {
-                // Only update if we don't already have this context
-                if (pendingReplyContext == null || pendingReplyContext!!.first != quotedMessageText) {
-                    pendingReplyContext = Triple(quotedMessageText, originalMessage.id, currentTime)
-                    Log.d(TAG, "  🔄 REPLY CONTEXT STORED: '$quotedMessageText' (ID: ${originalMessage.id})")
-                } else if (ULTRA_DEEP_LOGGING) {
-                    Log.d(TAG, "  ℹ️ Context unchanged (already stored)")
-                }
-            } else {
-                Log.w(TAG, "  ⚠️ Reply bar detected but original message not found in DB: '$quotedMessageText'")
-            }
-        } else {
-            // No reply bar visible - check if existing context has timed out
-            pendingReplyContext?.let { context ->
-                val age = currentTime - context.third
-                if (ULTRA_DEEP_LOGGING) {
-                    Log.d(TAG, "  No reply bar visible, context age: ${age}ms (timeout: ${REPLY_CONTEXT_TIMEOUT_MS}ms)")
-                }
-                if (age > REPLY_CONTEXT_TIMEOUT_MS) {
-                    Log.d(TAG, "  ⏱️ Reply context EXPIRED (${age}ms old)")
-                    pendingReplyContext = null
-                } else if (ULTRA_DEEP_LOGGING) {
-                    Log.d(TAG, "  ✓ Context preserved (still within timeout)")
-                }
-                // Don't clear if still within timeout - message might still be detected
-            }
-        }
-    }
-
-    /**
-     * Infers reply context for RECEIVED messages based on position heuristics.
-     * If a RECEIVED message appears shortly after and BELOW a SENT message,
-     * it's likely a reply to that message.
-     */
-    private fun inferReplyFromPosition(messageYPosition: Int, messageTimestamp: Long, contactName: String): Pair<String, Long>? {
-        // Clean up old entries (older than inference window)
-        val cutoffTime = messageTimestamp - REPLY_INFERENCE_WINDOW_MS
-        recentMessagesForReplyInference.removeAll { it.timestamp < cutoffTime }
-
-        // Find recent SENT messages (by user) that are ABOVE this received message
-        val candidateMessages = recentMessagesForReplyInference
-            .filter { it.isSentByUser } // Only look at user's messages
-            .filter { it.yPosition < messageYPosition } // Must be ABOVE (smaller Y)
-            .filter { messageTimestamp - it.timestamp < REPLY_INFERENCE_WINDOW_MS } // Within time window
-            .sortedByDescending { it.timestamp } // Most recent first
-
-        if (candidateMessages.isNotEmpty()) {
-            val mostRecentAbove = candidateMessages.first()
-            val timeDiff = messageTimestamp - mostRecentAbove.timestamp
-
-            if (ULTRA_DEEP_LOGGING) {
-                Log.d(TAG, "  🔍 POSITION-BASED REPLY INFERENCE:")
-                Log.d(TAG, "    Received message Y: $messageYPosition")
-                Log.d(TAG, "    Found ${candidateMessages.size} candidate(s) above")
-                Log.d(TAG, "    Best candidate: '${mostRecentAbove.messageText}' (Y: ${mostRecentAbove.yPosition}, ${timeDiff}ms ago)")
-            }
-
-            // If the time difference is reasonable (not too long), infer it's a reply
-            if (timeDiff < REPLY_INFERENCE_WINDOW_MS) {
-                Log.d(TAG, "  💡 INFERRED REPLY: This received message is likely replying to '${mostRecentAbove.messageText}'")
-                return Pair(mostRecentAbove.messageText, mostRecentAbove.messageId)
-            }
-        } else if (ULTRA_DEEP_LOGGING) {
-            Log.d(TAG, "  ℹ️ No recent SENT messages found above this RECEIVED message for reply inference")
-        }
-
-        return null
-    }
-
-    /**
-     * Dumps the UI hierarchy of a node for debugging (non-recursive, compact format)
-     */
-    private fun dumpNodeHierarchy(node: AccessibilityNodeInfo, prefix: String = "", maxDepth: Int = 6) {
-        if (maxDepth <= 0) return
-
-        var current: AccessibilityNodeInfo? = node
-        var depth = 0
-        val hierarchy = mutableListOf<String>()
-
-        // Walk up ancestors
-        while (current != null && depth < 6) {
-            val viewId = current.viewIdResourceName ?: ""
-            val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
-            val text = current.text?.toString() ?: ""
-            val className = current.className?.toString()?.substringAfterLast('.') ?: ""
-
-            val info = buildString {
-                append(className)
-                if (viewIdShort.isNotBlank()) append("[$viewIdShort]")
-                if (text.isNotBlank() && text.length <= 20) append("='$text'")
-            }
-
-            if (info.isNotBlank()) {
-                hierarchy.add(0, info) // Add to beginning to show from root to leaf
-            }
-
-            current = current.parent
-            depth++
-        }
-
-        Log.d(TAG, "$prefix ${hierarchy.joinToString(" > ")}")
-
-        // Also dump direct children
-        for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { child ->
-                val viewId = child.viewIdResourceName ?: ""
-                val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
-                val text = child.text?.toString() ?: ""
-                val className = child.className?.toString()?.substringAfterLast('.') ?: ""
-
-                if (viewIdShort.isNotBlank() || text.isNotBlank()) {
-                    Log.d(TAG, "  $prefix   CHILD[$i]: $className[$viewIdShort] text='${text.take(30)}'")
-                }
-                child.recycle()
-            }
-        }
-    }
-
-    /**
-     * Detects if a message bubble contains a quoted message (for received replies).
-     * Returns the quoted message text if found, null otherwise.
-     */
-    private fun findQuotedMessageInBubble(messageNode: AccessibilityNodeInfo): String? {
-        var quotedText: String? = null
-
-        // Search the message node and its siblings/ancestors for quoted message indicators
-        var current: AccessibilityNodeInfo? = messageNode.parent
-        var depth = 0
-
-        while (current != null && depth < 8) {
-            // Check this node and its children for quoted message text
-            fun searchForQuoted(node: AccessibilityNodeInfo, searchDepth: Int = 0) {
-                if (quotedText != null || searchDepth > 5) return
-
-                val viewId = node.viewIdResourceName ?: ""
-                val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
-                val text = node.text?.toString() ?: ""
-                val className = node.className?.toString() ?: ""
-
-                // Look for common quoted message viewIds in received message bubbles
-                // These are different from the compose reply bar
-                val isQuotedMessageIndicator = viewIdShort.equals("quoted_message_subtitle", ignoreCase = true) ||
-                                               viewIdShort.equals("message_quoted_content", ignoreCase = true) ||
-                                               viewIdShort.equals("replied_message_text", ignoreCase = true) ||
-                                               viewIdShort.equals("quoted_text", ignoreCase = true) ||
-                                               viewIdShort.equals("message_reply_snippet", ignoreCase = true)
-
-                // Also check for TextView with small text size (quoted messages typically use smaller font)
-                // inside a message bubble but not the main message text
-                if (isQuotedMessageIndicator && text.isNotBlank()) {
-                    quotedText = text
-                    if (ULTRA_DEEP_LOGGING) {
-                        Log.d(TAG, "  🔍 Found quoted message in bubble: '$text' (viewId: $viewIdShort)")
-                    }
-                    return
-                }
-
-                // Recursively search children
-                for (i in 0 until node.childCount) {
-                    node.getChild(i)?.let { child ->
-                        searchForQuoted(child, searchDepth + 1)
-                        child.recycle()
-                    }
-                }
-            }
-
-            searchForQuoted(current)
-
-            current = current.parent
-            depth++
-        }
-
-        // If we didn't find anything and ultra deep logging is on, dump the hierarchy for debugging
-        if (quotedText == null && ULTRA_DEEP_LOGGING) {
-            Log.d(TAG, "  ⚠️ NO QUOTED MESSAGE FOUND - Dumping UI hierarchy:")
-            dumpNodeHierarchy(messageNode, "    ")
-        }
-
-        return quotedText
-    }
 
     /**
      * Checks if a node is inside the reply bar (quoted message preview).
@@ -1727,13 +1528,11 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                                 // DB messageText will be set to null in captureNewMessages()
                                 val giftDesc = if (contentDesc.isNotBlank()) contentDesc else "Gift"
 
-                                val quotedMessageText = findQuotedMessageInBubble(node)
                                 messages.add(
                                     DetectedMessage(
                                         text = giftDesc,
                                         assetType = AssetType.GIFT,
-                                        node = AccessibilityNodeInfo.obtain(node),
-                                        quotedMessageText = quotedMessageText
+                                        node = AccessibilityNodeInfo.obtain(node)
                                     )
                                 )
                                 Log.d(TAG, "🎁 GIFT DETECTED: '$giftDesc' at pos(${bounds.left},${bounds.top})")
@@ -1805,15 +1604,12 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                     Log.d(TAG, "🎤 VOICE MESSAGE DETECTED: viewId='$viewIdShort' pos=(${bounds.left},${bounds.top})")
                     // Use generic text for database duplicate detection
                     val voiceText = "Voice message"
-                    // Check for quoted message in bubble
-                    val quotedMessageText = findQuotedMessageInBubble(node)
                     messages.add(DetectedMessage(
                         text = voiceText,
                         assetType = AssetType.VOICE_NOTE,
-                        node = AccessibilityNodeInfo.obtain(node),
-                        quotedMessageText = quotedMessageText
+                        node = AccessibilityNodeInfo.obtain(node)
                     ))
-                    Log.d(TAG, "✓ DETECTED [voice_note]: '$voiceText'${if (quotedMessageText != null) " (reply to: '$quotedMessageText')" else ""}")
+                    Log.d(TAG, "✓ DETECTED [voice_note]: '$voiceText'")
                 }
             }
 
@@ -1837,16 +1633,13 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
         val mediaId = "$assetType-${bounds.top}-${bounds.left}"
         if (!processedMediaIds.contains(mediaId)) {
             processedMediaIds.add(mediaId)
-            val quotedMessageText = findQuotedMessageInBubble(node)
-
             // if no desc, store a small placeholder for logging/dedup signature
             val descForKey = if (contentDesc.isNotBlank()) contentDesc else "animated_image"
             messages.add(
                 DetectedMessage(
                     text = descForKey,
                     assetType = assetType,
-                    node = AccessibilityNodeInfo.obtain(node),
-                    quotedMessageText = quotedMessageText
+                    node = AccessibilityNodeInfo.obtain(node)
                 )
             )
             Log.d(TAG, "✓ DETECTED [$assetType]: '$descForKey' at pos(${bounds.left},${bounds.top})")
@@ -1890,17 +1683,13 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
 
                     // CRITICAL: Exclude messages inside the reply bar (quoted message previews)
                     if (!isInsideReplyBar(node)) {
-                        // Check if this message bubble contains a quoted message (for received replies)
-                        val quotedMessageText = findQuotedMessageInBubble(node)
-
                         messages.add(DetectedMessage(
                             text = text,
                             assetType = AssetType.TEXT,
-                            node = AccessibilityNodeInfo.obtain(node),
-                            quotedMessageText = quotedMessageText
+                            node = AccessibilityNodeInfo.obtain(node)
                         ))
                         if (ULTRA_DEEP_LOGGING) {
-                            Log.d(TAG, "  ✅ ADDED to detection list${if (quotedMessageText != null) " (has quote: '$quotedMessageText')" else ""}")
+                            Log.d(TAG, "  ✅ ADDED to detection list")
                         }
                     } else {
                         Log.d(TAG, "  ⊘ EXCLUDED (inside reply bar): '$text'")
