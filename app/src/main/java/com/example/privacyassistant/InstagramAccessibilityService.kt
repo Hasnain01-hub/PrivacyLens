@@ -12,6 +12,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import java.text.SimpleDateFormat
 import java.util.*
 
@@ -40,6 +41,7 @@ class InstagramAccessibilityService : AccessibilityService() {
     private lateinit var messageDao: MessageDao
     private lateinit var notificationHelper: NotificationHelper
     private val ioScope = CoroutineScope(Dispatchers.IO)
+    private val scanMutex = Mutex()
 
     private var isInDirectMessages = false
     private var currentChatContact: String? = null
@@ -57,11 +59,27 @@ class InstagramAccessibilityService : AccessibilityService() {
     // Cache text fingerprints to avoid wasting auto-increment IDs on repeated IGNORE inserts
     private val savedTextFingerprints = mutableSetOf<String>()
 
+    // Pending messages: waiting for group timestamp label to scroll into view before saving.
+    // Key = fingerprint. Both text and media messages can be deferred.
+    private val pendingMessages = mutableMapOf<String, PendingMessage>()
+    private val PENDING_TIMEOUT_MS = 30_000L  // 30s before fallback save with null date
+
     // Data class to hold detected message info
     data class DetectedMessage(
         val text: String,
         val assetType: String,
         val node: AccessibilityNodeInfo
+    )
+
+    // Data class for messages waiting for their group timestamp label to become visible
+    data class PendingMessage(
+        val contactName: String,
+        val messageText: String,
+        val isSentByUser: Boolean,
+        val assetType: String,
+        val fingerprint: String,
+        val firstSeenMs: Long,
+        val mediaGroupKey: String? = null  // non-null for media, used for count tracking on flush
     )
 
     private var lastMessageCaptureTime = 0L
@@ -538,7 +556,10 @@ private fun collectUiTimestamps(rootNode: AccessibilityNodeInfo): List<UiTimesta
     return out
 }
 
-// Returns the best matching group label ABOVE this message, or null if none found
+// Returns the best matching group label for this message, or null if none found.
+// Instagram renders the first message of a group with its centerY slightly ABOVE
+// the group label's centerY (~70-100px). So we first try strict-above, then fall
+// back to labels slightly below the message within a tolerance window.
 private fun pickBestGroupLabel(
     messageBounds: android.graphics.Rect,
     uiTimestamps: List<UiTimestamp>
@@ -547,11 +568,18 @@ private fun pickBestGroupLabel(
 
     val msgY = messageBounds.centerY()
 
-    // Find the nearest timestamp label that is ABOVE this message
-    // NEVER use a label BELOW - that belongs to a later group
-    return uiTimestamps
+    // First: try strict above (label center is above message center)
+    val strictlyAbove = uiTimestamps
         .filter { it.y < msgY && it.parsedDate != null }
         .maxByOrNull { it.y }
+    if (strictlyAbove != null) return strictlyAbove
+
+    // Fallback: label slightly below the message (within tolerance).
+    // This handles the first-message-above-label rendering quirk in Instagram.
+    val LABEL_TOLERANCE = 120
+    return uiTimestamps
+        .filter { it.y in msgY..(msgY + LABEL_TOLERANCE) && it.parsedDate != null }
+        .minByOrNull { it.y }
 }
 
 
@@ -653,6 +681,7 @@ private fun extractMessageData(messageNode: AccessibilityNodeInfo): MessageData 
                 prevVisibleMediaCounts.clear()
                 mediaCalibrated = false
                 savedTextFingerprints.clear()
+                pendingMessages.clear()
             }
         }
     }
@@ -846,6 +875,7 @@ fun exportDataToFile() {
                 prevVisibleMediaCounts.clear()
                 mediaCalibrated = false
                 savedTextFingerprints.clear()
+                pendingMessages.clear()
                 try {
                     val counts = messageDao.getMediaCounts(contactName)
                     counts.forEach { mc ->
@@ -853,8 +883,13 @@ fun exportDataToFile() {
                         mediaSavedCounts[key] = mc.cnt
                     }
                     Log.d(TAG, "📊 Media counts from DB: $mediaSavedCounts")
+
+                    // Load all saved fingerprints so count-based dedup has an accurate baseline
+                    val fps = messageDao.getFingerprints(contactName)
+                    savedTextFingerprints.addAll(fps)
+                    Log.d(TAG, "📊 Loaded ${fps.size} fingerprints from DB")
                 } catch (e: Exception) {
-                    Log.e(TAG, "Error loading media counts: ${e.message}")
+                    Log.e(TAG, "Error loading media counts / fingerprints: ${e.message}")
                 }
 
                 // Save contact if not already saved
@@ -919,6 +954,11 @@ private fun buildFingerprint(
 }
 
 private suspend fun captureNewMessages() {
+    // Serialize: only one scan at a time to prevent concurrent label/timestamp races
+    if (!scanMutex.tryLock()) {
+        Log.d(TAG, "⏭️ SCAN already in progress, skipping")
+        return
+    }
     try {
         val rootNode = rootInActiveWindow ?: return
         val contactName = currentChatContact ?: "Unknown"
@@ -995,108 +1035,105 @@ private suspend fun captureNewMessages() {
         }
 
         var newMessageCount = 0
-        val dateFmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
 
-        // Helper to insert a message with proper date/time/groupLabelMessageId
-        // Uses DB lookups instead of screen-position to determine "first in group",
-        // so scrolling doesn't break groupLabelMessageId assignment.
-        suspend fun insertWithGroupLabel(
-            mi: MsgInfo,
-            fp: String,
-            logTag: String,
-            ordinal: Int? = null
-        ): Long {
-            val bounds = android.graphics.Rect()
-            mi.detected.node.getBoundsInScreen(bounds)
-            val label = pickBestGroupLabel(bounds, uiTimestamps)
-
-            val msgDate: String?
-            val msgTime: String?
-            var msgGroupLabelId: Long? = null
-
-            if (label != null && label.parsedDate != null) {
-                msgDate = label.parsedDate
-
-                if (label.parsedTime != null) {
-                    // Label has time (e.g. "9 Feb, 21:06", "Tue 14:45")
-                    // Check DB: is there already a first message for this date+time?
-                    val existingFirstId = messageDao.getFirstMessageIdByDateAndTime(
-                        contactName, msgDate, label.parsedTime
-                    )
-                    if (existingFirstId == null) {
-                        // No first message yet → this IS the first, gets the time
-                        msgTime = label.parsedTime
-                        msgGroupLabelId = null
-                    } else {
-                        // First message already exists → point to it, no time
-                        msgTime = null
-                        msgGroupLabelId = existingFirstId
-                    }
-                } else {
-                    // Label has no time (e.g. "24 Dec 2020", "Yesterday")
-                    // Check DB: is there already any message for this date?
-                    val existingFirstId = messageDao.getFirstMessageIdByDate(contactName, msgDate)
-                    if (existingFirstId == null) {
-                        // No message yet → this IS the first for this date
-                        msgTime = null
-                        msgGroupLabelId = null
-                    } else {
-                        // First message already exists → point to it
-                        msgTime = null
-                        msgGroupLabelId = existingFirstId
-                    }
-                }
-            } else {
-                // No group label above (scrolled off) → use today's date as fallback
-                msgDate = dateFmt.format(java.util.Date())
-                msgTime = null
-                // Still check DB: if there's already a message for this date, point to it
-                val existingFirstId = messageDao.getFirstMessageIdByDate(contactName, msgDate)
-                if (existingFirstId != null) {
-                    msgGroupLabelId = existingFirstId
-                }
-            }
-
+        // --- Flush timed-out pending messages (save with null date as fallback) ---
+        val flushNow = System.currentTimeMillis()
+        val timedOutKeys = pendingMessages.keys.filter { fp ->
+            flushNow - pendingMessages[fp]!!.firstSeenMs > PENDING_TIMEOUT_MS
+        }
+        timedOutKeys.forEach { fp ->
+            val pm = pendingMessages.remove(fp) ?: return@forEach
             val message = Message(
-                id = 0, contactName = contactName, messageText = mi.messageText,
-                date = msgDate, time = msgTime, groupLabelMessageId = msgGroupLabelId,
-                isSentByUser = mi.isSentByUser,
-                assetType = mi.assetType, fingerprint = fp
+                id = 0, contactName = pm.contactName, messageText = pm.messageText,
+                date = null, time = null, groupLabelMessageId = null,
+                isSentByUser = pm.isSentByUser,
+                assetType = pm.assetType, fingerprint = pm.fingerprint
             )
-
             val messageId = messageDao.insert(message)
             if (messageId != -1L) {
                 newMessageCount++
-                val direction = if (mi.isSentByUser) "SENT" else "RECEIVED"
-                val ordStr = if (ordinal != null) ", ordinal: $ordinal" else ""
-                Log.d(TAG, "  ✅ SAVED [$logTag] [$direction]: '${mi.detected.text.take(50)}' (ID: $messageId$ordStr, date=$msgDate, time=$msgTime, groupRef=$msgGroupLabelId)")
+                Log.d(TAG, "  ⏰ TIMEOUT FLUSH [${pm.assetType}]: '${pm.messageText.take(50)}' (ID: $messageId, date=null)")
+                if (pm.assetType == AssetType.TEXT) {
+                    savedTextFingerprints.add(fp)
+                }
+                if (pm.mediaGroupKey != null) {
+                    mediaSavedCounts[pm.mediaGroupKey] = mediaSavedCounts.getOrDefault(pm.mediaGroupKey, 0) + 1
+                }
             }
-            return messageId
         }
 
-        // ---- TEXT MESSAGES: ordinal-based fingerprints ----
+        // === UNIFIED PROCESSING: all messages grouped by label ===
+        // Process text + media together so the ACTUAL first message under a label
+        // (whether text, image, video, etc.) gets date+time correctly.
+
+        data class NewMessage(
+            val mi: MsgInfo,
+            val fingerprint: String,
+            val ordinal: Int?,
+            val isText: Boolean,
+            val mediaGroupKey: String?  // non-null for media, used to increment savedCount
+        )
+
+        val newMessages = mutableListOf<NewMessage>()
+
+        // --- Step 1: Identify new TEXT messages (count-based dedup) ---
+        // Groups identical text messages and compares visible count against DB + pending count.
+        // Ordinals are assigned sequentially (accountedFor, accountedFor+1, …) so they never
+        // shift when the user scrolls and the same text appears at different screen-Y positions.
         val textMsgs = msgInfos.filter { it.assetType == AssetType.TEXT }
-        textMsgs.forEach { mi ->
-            val ordinal = textMsgs.count { other ->
-                other.fingerprintBase == mi.fingerprintBase &&
-                other.screenY < mi.screenY
+        val textMsgsByContent = textMsgs.groupBy { "${it.isSentByUser}|${it.messageText.trim()}" }
+
+        textMsgsByContent.forEach { (contentKey, group) ->
+            val sorted = group.sortedBy { it.screenY }
+            val visibleCount = sorted.size
+            val rep = sorted[0]
+
+            // How many of this exact text+sender are already saved in DB?
+            val savedCount = messageDao.countTextByContent(contactName, rep.messageText, rep.isSentByUser)
+            // How many are pending (waiting for their group label)?
+            val pendingCount = pendingMessages.values.count {
+                it.assetType == AssetType.TEXT &&
+                it.contactName == contactName &&
+                it.messageText.trim() == rep.messageText.trim() &&
+                it.isSentByUser == rep.isSentByUser
+            }
+            val accountedFor = savedCount + pendingCount
+            val newCount = maxOf(0, visibleCount - accountedFor)
+
+            if (ULTRA_DEEP_LOGGING) {
+                Log.d(TAG, "📝 TEXT GROUP '$contentKey': visible=$visibleCount saved=$savedCount pending=$pendingCount new=$newCount")
             }
 
-            val fp = buildFingerprint(contactName, mi.assetType, mi.isSentByUser,
-                mi.messageText, null, ordinal)
-
-            // Skip DB insert if we already know this fingerprint was saved
-            if (fp in savedTextFingerprints) {
-                mi.detected.node.recycle()
-                return@forEach
+            if (newCount > 0) {
+                // Assign next sequential ordinals to the bottom N messages (most recent)
+                sorted.takeLast(newCount).forEachIndexed { index, mi ->
+                    val ordinal = accountedFor + index
+                    val fp = buildFingerprint(contactName, mi.assetType, mi.isSentByUser,
+                        mi.messageText, null, ordinal)
+                    newMessages.add(NewMessage(mi, fp, ordinal, isText = true, mediaGroupKey = null))
+                }
             }
-
-            insertWithGroupLabel(mi, fp, "text", ordinal)
-            savedTextFingerprints.add(fp)
-            mi.detected.node.recycle()
         }
 
-        // ---- MEDIA MESSAGES: count-based dedup ----
+        // --- Step 1b: Re-add pending text for label re-checking ---
+        // Pending text messages won't be re-detected by count-based dedup (they're in
+        // accountedFor). We must re-add them so Step 4 can flush them when their label appears.
+        pendingMessages.forEach { (fp, pm) ->
+            if (pm.assetType == AssetType.TEXT && pm.contactName == contactName) {
+                val matchingMi = textMsgs.firstOrNull {
+                    it.messageText.trim() == pm.messageText.trim() &&
+                    it.isSentByUser == pm.isSentByUser
+                }
+                if (matchingMi != null && newMessages.none { it.fingerprint == fp }) {
+                    newMessages.add(NewMessage(matchingMi, fp, null, isText = true, mediaGroupKey = null))
+                    if (ULTRA_DEEP_LOGGING) {
+                        Log.d(TAG, "📝 RE-ADDED pending text for label re-check: '${pm.messageText.take(30)}' fp=${fp.take(8)}")
+                    }
+                }
+            }
+        }
+
+        // --- Step 2: Identify new MEDIA messages (count-based dedup) ---
         val mediaMsgs = msgInfos.filter { it.assetType != AssetType.TEXT }
         val mediaGroups = mediaMsgs.groupBy { "$contactName|${it.assetType}|${it.isSentByUser}" }
 
@@ -1109,21 +1146,17 @@ private suspend fun captureNewMessages() {
             if (!mediaCalibrated) {
                 newCount = maxOf(0, currentVisible - savedCount)
             } else {
-                // Use max(prevVisible, savedCount) to prevent scroll duplicates:
-                // During scroll, media can temporarily disappear (prevVisible drops to 0),
-                // then reappear and get falsely counted as "new". savedCount acts as a
-                // floor so we never save more than truly new media.
                 val prevVisible = prevVisibleMediaCounts.getOrDefault(groupKey, 0)
                 val baseline = maxOf(prevVisible, savedCount)
                 newCount = maxOf(0, currentVisible - baseline)
             }
 
-            prevVisibleMediaCounts[groupKey] = currentVisible
-
             if (ULTRA_DEEP_LOGGING) {
                 val prevVis = if (mediaCalibrated) prevVisibleMediaCounts.getOrDefault(groupKey, 0).toString() else "N/A(first)"
                 Log.d(TAG, "📊 MEDIA GROUP '$groupKey': visible=$currentVisible saved=$savedCount prevVisible=$prevVis new=$newCount calibrated=$mediaCalibrated")
             }
+
+            prevVisibleMediaCounts[groupKey] = currentVisible
 
             if (newCount > 0) {
                 val newMsgs = sorted.takeLast(newCount)
@@ -1131,15 +1164,12 @@ private suspend fun captureNewMessages() {
                     val ordinal = savedCount + index
                     val fp = buildFingerprint(contactName, mi.assetType, mi.isSentByUser,
                         mi.messageText, mi.detected.text, ordinal)
-                    insertWithGroupLabel(mi, fp, mi.assetType, ordinal)
+                    newMessages.add(NewMessage(mi, fp, ordinal, isText = false, mediaGroupKey = groupKey))
                 }
-                mediaSavedCounts[groupKey] = savedCount + newCount
             }
-
-            sorted.forEach { it.detected.node.recycle() }
         }
 
-        // Reset prevVisible to 0 for media types no longer visible on screen
+        // Reset prevVisible for media types no longer on screen
         val visibleGroupKeys = mediaGroups.keys
         val staleKeys = prevVisibleMediaCounts.keys.filter { it !in visibleGroupKeys }
         staleKeys.forEach { key ->
@@ -1148,9 +1178,169 @@ private suspend fun captureNewMessages() {
             }
             prevVisibleMediaCounts[key] = 0
         }
-
         if (mediaMsgs.isNotEmpty() || mediaCalibrated) {
             mediaCalibrated = true
+        }
+
+        // --- Step 2b: Re-add pending media for label re-checking ---
+        // Media uses count-based dedup which won't re-detect pending (unsaved) media.
+        // We iterate all visible media, compute fingerprints, and check against pending.
+        mediaGroups.forEach { (groupKey, group) ->
+            val sorted = group.sortedBy { it.screenY }
+            sorted.forEachIndexed { index, mi ->
+                val fp = buildFingerprint(contactName, mi.assetType, mi.isSentByUser,
+                    mi.messageText, mi.detected.text, index)
+                if (fp in pendingMessages && newMessages.none { it.fingerprint == fp }) {
+                    newMessages.add(NewMessage(mi, fp, index, isText = false, mediaGroupKey = groupKey))
+                    if (ULTRA_DEEP_LOGGING) {
+                        Log.d(TAG, "📊 RE-ADDED pending media for label re-check: fp=${fp.take(8)} groupKey=$groupKey")
+                    }
+                }
+            }
+        }
+
+        // --- Step 3: Assign label to each message and split into has-label / no-label ---
+        data class LabeledMsg(val nm: NewMessage, val label: UiTimestamp?)
+
+        val labeledMsgs = newMessages.map { nm ->
+            val bounds = android.graphics.Rect()
+            nm.mi.detected.node.getBoundsInScreen(bounds)
+            val label = pickBestGroupLabel(bounds, uiTimestamps)
+            LabeledMsg(nm, if (label?.parsedDate != null) label else null)
+        }
+
+        val withLabel = labeledMsgs.filter { it.label != null }
+        val withoutLabel = labeledMsgs.filter { it.label == null }
+
+        if (ULTRA_DEEP_LOGGING) {
+            Log.d(TAG, "🔄 PROCESSING ${newMessages.size} messages: ${withLabel.size} with label, ${withoutLabel.size} without")
+            uiTimestamps.forEach { ts ->
+                Log.d(TAG, "   📅 '${ts.raw}' y=${ts.y} date=${ts.parsedDate} time=${ts.parsedTime}")
+            }
+            Log.d(TAG, "   Pending buffer size: ${pendingMessages.size}")
+        }
+
+        // --- Step 4: Group messages by label, save first-in-group first ---
+        // This guarantees the TOPMOST message under a label (nearest to it on screen)
+        // becomes the "first" message with date+time, and all others point to it.
+        val byLabelKey = withLabel.groupBy { lm ->
+            val l = lm.label!!
+            "${l.parsedDate}|${l.parsedTime ?: ""}"
+        }
+
+        byLabelKey.forEach { (labelKey, group) ->
+            val sortedByY = group.sortedBy { it.nm.mi.screenY }
+            val label = sortedByY[0].label!!
+
+            // Check DB: does a "first" message already exist for this date+time?
+            val existingFirstFromDB: Long? = if (label.parsedTime != null) {
+                messageDao.getFirstMessageIdByDateAndTime(contactName, label.parsedDate!!, label.parsedTime!!)
+            } else {
+                messageDao.getFirstMessageIdByDate(contactName, label.parsedDate!!)
+            }
+            var firstId = existingFirstFromDB
+
+            if (ULTRA_DEEP_LOGGING) {
+                Log.d(TAG, "   📦 LABEL GROUP '$labelKey': ${sortedByY.size} msgs, existingFirstId=$firstId")
+            }
+
+            sortedByY.forEachIndexed { index, lm ->
+                val nm = lm.nm
+                val mi = nm.mi
+                val fp = nm.fingerprint
+                val isTopmost = (index == 0)
+
+                // If this was pending, remove from pending buffer
+                val wasPending = fp in pendingMessages
+                if (wasPending) pendingMessages.remove(fp)
+
+                // Decide if this message should be the "first" under this label.
+                // Case 1: No first exists yet → this topmost message becomes first.
+                // Case 2: A first exists from DB, but this NEW topmost message is CLOSER
+                //         to the label (appeared after more scrolling) → REASSIGN first.
+                val shouldBeFirst = if (firstId == null) {
+                    true
+                } else if (isTopmost && existingFirstFromDB != null) {
+                    true // Will reassign if INSERT succeeds (message is genuinely new)
+                } else {
+                    false
+                }
+
+                val msgTime = if (shouldBeFirst) label.parsedTime else null
+                val msgGroupRef = if (shouldBeFirst) null else firstId
+
+                val message = Message(
+                    id = 0, contactName = contactName, messageText = mi.messageText,
+                    date = label.parsedDate, time = msgTime, groupLabelMessageId = msgGroupRef,
+                    isSentByUser = mi.isSentByUser,
+                    assetType = mi.assetType, fingerprint = fp
+                )
+
+                val messageId = messageDao.insert(message)
+                if (messageId != -1L) {
+                    newMessageCount++
+
+                    if (shouldBeFirst) {
+                        if (existingFirstFromDB != null && isTopmost) {
+                            // REASSIGN: this new message is closer to the label
+                            // 1. Demote old first: clear its time, point it to new first
+                            messageDao.demoteFromFirst(existingFirstFromDB, messageId)
+                            // 2. Redirect all messages that pointed to old first → new first
+                            messageDao.reassignGroupRef(contactName, existingFirstFromDB, messageId)
+                            Log.d(TAG, "  🔄 REASSIGNED first: old=#$existingFirstFromDB → new=#$messageId")
+                        }
+                        firstId = messageId
+                    }
+
+                    val tag = if (wasPending) "${mi.assetType}-flushed" else mi.assetType
+                    val direction = if (mi.isSentByUser) "SENT" else "RECEIVED"
+                    Log.d(TAG, "  ✅ SAVED [$tag] [$direction]: '${mi.detected.text.take(50)}' (ID: $messageId, date=${label.parsedDate}, time=$msgTime, groupRef=$msgGroupRef)")
+
+                    // Update caches
+                    if (nm.isText) savedTextFingerprints.add(fp)
+                    if (nm.mediaGroupKey != null) {
+                        mediaSavedCounts[nm.mediaGroupKey!!] = mediaSavedCounts.getOrDefault(nm.mediaGroupKey!!, 0) + 1
+                    }
+                } else {
+                    // INSERT IGNORE — already saved. Look up its ID so the chain stays correct.
+                    if (firstId == null) {
+                        val existingId = messageDao.getIdByFingerprint(contactName, fp)
+                        if (existingId != null) firstId = existingId
+                    }
+                }
+            }
+        }
+
+        // --- Step 5: Messages without a label → defer to pending buffer ---
+        withoutLabel.forEach { lm ->
+            val nm = lm.nm
+            val fp = nm.fingerprint
+
+            // Already pending → just leave it (Step 1b/2b re-added it for label re-check but label still absent)
+            if (fp in pendingMessages) {
+                if (ULTRA_DEEP_LOGGING) {
+                    Log.d(TAG, "  ⏳ STILL PENDING: '${nm.mi.messageText.take(50)}' [${nm.mi.assetType}]")
+                }
+            } else {
+                // New message with no label above — cache it
+                pendingMessages[fp] = PendingMessage(
+                    contactName = contactName,
+                    messageText = nm.mi.messageText,
+                    isSentByUser = nm.mi.isSentByUser,
+                    assetType = nm.mi.assetType,
+                    fingerprint = fp,
+                    firstSeenMs = System.currentTimeMillis(),
+                    mediaGroupKey = nm.mediaGroupKey
+                )
+                if (ULTRA_DEEP_LOGGING) {
+                    Log.d(TAG, "  ⏳ DEFERRED (no label): '${nm.mi.messageText.take(50)}' [${nm.mi.assetType}]")
+                }
+            }
+        }
+
+        // Cleanup: recycle all detected message nodes
+        msgInfos.forEach { mi ->
+            try { mi.detected.node.recycle() } catch (_: Exception) {}
         }
 
         if (newMessageCount > 0) {
@@ -1160,6 +1350,8 @@ private suspend fun captureNewMessages() {
         rootNode.recycle()
     } catch (e: Exception) {
         Log.e(TAG, "Error capturing messages: ${e.message}", e)
+    } finally {
+        scanMutex.unlock()
     }
 }
 

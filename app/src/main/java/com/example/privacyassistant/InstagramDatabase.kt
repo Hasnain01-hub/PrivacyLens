@@ -170,6 +170,22 @@ interface MessageDao {
     """)
     suspend fun getMediaCounts(contactName: String): List<MediaTypeCount>
 
+    // Get all fingerprints for a contact (loaded on chat open for dedup cache)
+    @Query("SELECT fingerprint FROM messages WHERE contactName = :contactName")
+    suspend fun getFingerprints(contactName: String): List<String>
+
+    // Count text messages with same content+sender (for count-based text dedup)
+    @Query("SELECT COUNT(*) FROM messages WHERE contactName = :contactName AND messageText = :messageText AND isSentByUser = :isSentByUser AND assetType = 'text'")
+    suspend fun countTextByContent(contactName: String, messageText: String, isSentByUser: Boolean): Int
+
+    // Demote old "first" message: clear its time, point it to the new first
+    @Query("UPDATE messages SET time = NULL, groupLabelMessageId = :newFirstId WHERE id = :oldFirstId")
+    suspend fun demoteFromFirst(oldFirstId: Long, newFirstId: Long)
+
+    // Redirect all messages that pointed to the old first → point to the new first
+    @Query("UPDATE messages SET groupLabelMessageId = :newFirstId WHERE contactName = :contactName AND groupLabelMessageId = :oldFirstId")
+    suspend fun reassignGroupRef(contactName: String, oldFirstId: Long, newFirstId: Long)
+
 }
 
 // Data class for media count-based dedup
