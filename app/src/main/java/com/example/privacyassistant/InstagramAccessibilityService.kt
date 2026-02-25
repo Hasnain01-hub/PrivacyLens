@@ -52,7 +52,8 @@ class InstagramAccessibilityService : AccessibilityService() {
     data class DetectedMessage(
         val text: String,
         val assetType: String,
-        val node: AccessibilityNodeInfo
+        val node: AccessibilityNodeInfo,
+        val duration: String? = null 
     )
 
     data class PendingMessage(
@@ -194,6 +195,59 @@ data class UiTimestamp(
     val x: Int
 )
 
+private fun extractDurationFromNode(node: AccessibilityNodeInfo, depth: Int = 0): String? {
+    if (depth > 6) return null
+    val text = node.text?.toString()?.trim() ?: ""
+    val desc = node.contentDescription?.toString()?.trim() ?: ""
+
+    // Matches patterns like "1:23", "0:45", "12:34"
+    val durationRegex = Regex("""^\d{1,2}:\d{2}$""")
+    if (durationRegex.matches(text)) return text
+    if (durationRegex.matches(desc)) return desc
+
+    for (i in 0 until node.childCount) {
+        val child = node.getChild(i) ?: continue
+        val found = extractDurationFromNode(child, depth + 1)
+        child.recycle()
+        if (found != null) return found
+    }
+    return null
+}
+
+private fun isCallNode(node: AccessibilityNodeInfo, depth: Int = 0): Pair<Boolean, String?> {
+    if (depth > 6) return false to null
+    val text = node.text?.toString()?.lowercase() ?: ""
+    val desc = node.contentDescription?.toString()?.lowercase() ?: ""
+    val viewId = (node.viewIdResourceName ?: "").lowercase()
+
+    val callKeywords = listOf(
+        "started a video call", "started a voice call",
+        "missed video call", "missed voice call",
+        "video chat", "voice chat",
+        "unavailable", "video call", "voice call",
+        "joined the call", "ended the call"
+    )
+
+    val isCall = callKeywords.any { kw -> desc.contains(kw) || text.contains(kw) } ||
+                 viewId.contains("call_bubble") || viewId.contains("voice_call") || viewId.contains("video_call")
+
+    if (isCall) {
+        // Try to extract duration like "1:23" or "Ended · 1:23"
+        val durationRegex = Regex("""(\d{1,2}:\d{2})""")
+        val durationFromDesc = durationRegex.find(desc)?.groupValues?.get(1)
+        val durationFromText = durationRegex.find(text)?.groupValues?.get(1)
+        val duration = durationFromDesc ?: durationFromText ?: extractDurationFromNode(node)
+        return true to duration
+    }
+
+    for (i in 0 until node.childCount) {
+        val child = node.getChild(i) ?: continue
+        val (found, dur) = isCallNode(child, depth + 1)
+        child.recycle()
+        if (found) return true to dur
+    }
+    return false to null
+}
 private fun parseInstagramGroupLabel(
     rawLabel: String,
     nowMs: Long = System.currentTimeMillis()
@@ -889,7 +943,8 @@ private suspend fun captureNewMessages() {
             val messageText: String,
             val assetType: String,
             val screenY: Int,
-            val fingerprintBase: String
+            val fingerprintBase: String,
+            val duration: String? = null 
         )
 
         val msgInfos = mutableListOf<MsgInfo>()
@@ -919,7 +974,7 @@ private suspend fun captureNewMessages() {
                 }
             }
 
-            msgInfos.add(MsgInfo(detected, isSentByUser, messageText, assetType, bounds.centerY(), fpBase))
+            msgInfos.add(MsgInfo(detected, isSentByUser, messageText, assetType, bounds.centerY(), fpBase, duration = detected.duration))
         }
 
         var newMessageCount = 0
@@ -1039,7 +1094,8 @@ private suspend fun captureNewMessages() {
                     id = 0, contactName = contactName, messageText = mi.messageText,
                     date = label.parsedDate, time = msgTime, groupLabelMessageId = msgGroupRef,
                     isSentByUser = mi.isSentByUser,
-                    assetType = mi.assetType, fingerprint = fp
+                    assetType = mi.assetType, fingerprint = fp,
+                    duration = mi.duration 
                 )
 
                 val messageId = messageDao.insert(message)
@@ -1438,7 +1494,29 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
             val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
             val looksLikeGift = nodeContainsGiftKeyword(node)
 
-                        if (looksLikeGift) {
+            // ── CALL DETECTION ──────────────────────────────────────────
+            val (isCall, callDuration) = isCallNode(node)
+            if (isCall) {
+                val bounds = android.graphics.Rect()
+                node.getBoundsInScreen(bounds)
+                val callId = "call-${bounds.top}-${bounds.left}"
+                if (!processedMediaIds.contains(callId)) {
+                    processedMediaIds.add(callId)
+                    val callDesc = node.contentDescription?.toString()
+                        ?: node.text?.toString()
+                        ?: "Call"
+                    messages.add(DetectedMessage(
+                        text = callDesc,
+                        assetType = AssetType.CALL,
+                        node = AccessibilityNodeInfo.obtain(node),
+                        duration = callDuration
+                    ))
+                    Log.d(TAG, "📞 CALL DETECTED: '$callDesc' duration=$callDuration pos=(${bounds.left},${bounds.top})")
+                }
+                return
+            }            
+
+            if (looksLikeGift) {
                             val bounds = android.graphics.Rect()
                             node.getBoundsInScreen(bounds)
                             val giftId = "gift-${bounds.top}-${bounds.left}"
@@ -1503,20 +1581,21 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
 
             val isMediaNode = matchesValidMediaViewId
             if (isMediaNode && viewIdShort.equals("message_content_voice_playback_timer", ignoreCase = true)) {
-                val bounds = android.graphics.Rect()
-                node.getBoundsInScreen(bounds)
-                val mediaId = "voice_note-${bounds.top}-${bounds.left}"
-                if (!processedMediaIds.contains(mediaId)) {
-                    processedMediaIds.add(mediaId)
-                    Log.d(TAG, "🎤 VOICE MESSAGE DETECTED: viewId='$viewIdShort' pos=(${bounds.left},${bounds.top})")
-                    val voiceText = "Voice message"
-                    messages.add(DetectedMessage(
-                        text = voiceText,
-                        assetType = AssetType.VOICE_NOTE,
-                        node = AccessibilityNodeInfo.obtain(node)
-                    ))
-                    Log.d(TAG, "✓ DETECTED [voice_note]: '$voiceText'")
-                }
+                  val bounds = android.graphics.Rect()
+            node.getBoundsInScreen(bounds)
+            val mediaId = "voice_note-${bounds.top}-${bounds.left}"
+            if (!processedMediaIds.contains(mediaId)) {
+                processedMediaIds.add(mediaId)
+                val voiceDuration = extractDurationFromNode(node) // to get DURATION
+                Log.d(TAG, "🎤 VOICE MESSAGE DETECTED: viewId='$viewIdShort' duration=$voiceDuration pos=(${bounds.left},${bounds.top})")
+                messages.add(DetectedMessage(
+                    text = "Voice message",
+                    assetType = AssetType.VOICE_NOTE,
+                    node = AccessibilityNodeInfo.obtain(node),
+                    duration = voiceDuration  // ADD THIS
+                ))
+                Log.d(TAG, "✓ DETECTED [voice_note]: duration=$voiceDuration")
+            }
             }
 
             if (isMediaNode && (contentDesc.isNotBlank() || viewIdShort.equals("animated_image", ignoreCase = true))) {

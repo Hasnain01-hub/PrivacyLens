@@ -44,6 +44,7 @@ object AssetType {
     const val STICKER = "sticker"
     const val VOICE_NOTE = "voice_note"
     const val GIFT = "gift" 
+    const val CALL = "call" 
 }
 
 @Entity(
@@ -61,7 +62,8 @@ data class Message(
     val groupLabelMessageId: Long? = null,
     val isSentByUser: Boolean = false,
     val assetType: String = AssetType.TEXT,
-    val fingerprint: String
+    val fingerprint: String,
+    val duration: String? = null 
 )
 
 
@@ -199,7 +201,7 @@ data class MessageWithReadableTime(
 
 @Database(
     entities = [Contact::class, Message::class],
-    version = 11,
+    version = 12,
     exportSchema = true
 )
 @androidx.room.TypeConverters(TimeConverters::class)
