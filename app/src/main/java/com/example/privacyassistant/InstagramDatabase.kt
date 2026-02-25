@@ -200,17 +200,60 @@ data class MessageWithReadableTime(
             else -> "unknown"
         }
 }
+// ── Usage tracking (first/last open) ────────────────────────
+@Entity(tableName = "app_usage")
+data class AppUsage(
+    @PrimaryKey val id: Int = 1, // singleton row
+    val firstOpenMs: Long,
+    val lastOpenMs: Long
+)
+
+@Dao
+interface AppUsageDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(usage: AppUsage)
+
+    @Query("UPDATE app_usage SET lastOpenMs = :now WHERE id = 1")
+    suspend fun updateLastOpen(now: Long)
+
+    @Query("SELECT * FROM app_usage WHERE id = 1")
+    suspend fun get(): AppUsage?
+}
+
+// ── Contact classification ───────────────────────────────────
+enum class ContactRelation { FRIEND, MUTUAL_FRIEND, FAMILY, UNKNOWN }
+
+@Entity(tableName = "contact_relations")
+data class ContactRelation_Entity(
+    @PrimaryKey val contactName: String,
+    val relation: String,           // stores ContactRelation.name
+    val classifiedAtMs: Long = System.currentTimeMillis()
+)
+
+@Dao
+interface ContactRelationDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entry: ContactRelation_Entity)
+
+    @Query("SELECT contactName FROM contact_relations")
+    suspend fun getAllClassifiedNames(): List<String>
+
+    @Query("SELECT * FROM contact_relations")
+    suspend fun getAll(): List<ContactRelation_Entity>
+}
 
 @Database(
-    entities = [Contact::class, Message::class],
-    version = 12,
+    entities = [Contact::class, Message::class, AppUsage::class, ContactRelation_Entity::class],
+    version = 13,
     exportSchema = true
 )
 @androidx.room.TypeConverters(TimeConverters::class)
 abstract class InstagramDatabase : androidx.room.RoomDatabase(){
     abstract fun contactDao(): ContactDao
     abstract fun messageDao(): MessageDao
-    
+    abstract fun appUsageDao(): AppUsageDao
+    abstract fun contactRelationDao(): ContactRelationDao
+
     companion object {
         @Volatile
         private var INSTANCE: InstagramDatabase? = null
