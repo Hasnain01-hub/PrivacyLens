@@ -1515,6 +1515,48 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                 }
                 return
             }            
+            // ── REEL / POST DETECTION ────────────────────────────────────
+            val viewIdShortLower = viewIdShort.lowercase()
+            val descLower = contentDesc.lowercase()
+            val textLower = text.lowercase()
+
+            val isReel = viewIdShortLower.contains("reel") ||
+                        viewIdShortLower.contains("clips_share") ||
+                        viewIdShortLower.contains("clips_viewer") ||
+                        descLower.contains("sent a reel") ||
+                        descLower.contains("shared a reel") ||
+                        descLower.contains("reel by") ||
+                        textLower.contains("sent a reel") ||
+                        textLower == "reel"
+
+            val isPost = !isReel && (
+                        viewIdShortLower.contains("media_share") ||
+                        viewIdShortLower.contains("post_share") ||
+                        viewIdShortLower.contains("feed_share") ||
+                        descLower.contains("sent a post") ||
+                        descLower.contains("shared a post") ||
+                        descLower.contains("post by") ||
+                        descLower.contains("photo by") ||
+                        textLower.contains("sent a post") ||
+                        textLower == "post")
+
+            if (isReel || isPost) {
+                val assetType = if (isReel) AssetType.REEL else AssetType.POST
+                val bounds = android.graphics.Rect()
+                node.getBoundsInScreen(bounds)
+                val shareId = "$assetType-${bounds.top}-${bounds.left}"
+
+                if (!processedMediaIds.contains(shareId)) {
+                    processedMediaIds.add(shareId)
+                    messages.add(DetectedMessage(
+                        text = "",          
+                        assetType = assetType,
+                        node = AccessibilityNodeInfo.obtain(node)
+                    ))
+                    Log.d(TAG, "🎞️ ${assetType.uppercase()} DETECTED pos=(${bounds.left},${bounds.top})")
+                }
+                return
+            }
 
             if (looksLikeGift) {
                             val bounds = android.graphics.Rect()

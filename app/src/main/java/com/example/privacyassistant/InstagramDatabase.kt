@@ -45,6 +45,8 @@ object AssetType {
     const val VOICE_NOTE = "voice_note"
     const val GIFT = "gift" 
     const val CALL = "call" 
+    const val REEL = "reel" 
+    const val POST = "post"
 }
 
 @Entity(
