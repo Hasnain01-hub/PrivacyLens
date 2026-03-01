@@ -8,6 +8,9 @@ import android.content.Context
 import android.provider.Settings
 import android.os.Build
 import android.os.Bundle
+import androidx.activity.viewModels
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
 import android.util.Log
 import androidx.core.app.ActivityCompat
 import androidx.activity.ComponentActivity
@@ -102,6 +105,8 @@ class PvcAssistant : ComponentActivity() {
         user = UserHelper(-1, -1, -1, -1, -1, -1)
 
         setContent {
+        val classificationState by classificationViewModel.state.collectAsState()
+        val classificationSelections by classificationViewModel.selections.collectAsState()
             var isDarkTheme by remember { mutableStateOf(false) }
             val lightColors = lightColorScheme(
                 primary = Color(0xFF8E24AA),
@@ -119,17 +124,27 @@ class PvcAssistant : ComponentActivity() {
                 surface = Color(0xFF1E1E1E),
                 onSurface = Color.White
             )
-            MaterialTheme(
-                colorScheme = if (isDarkTheme) darkColors else lightColors
-            ) {
-                PvcAssistantScreen(
-                    viewModel = viewModel,
-                    isDarkTheme = isDarkTheme,
-                    onToggleTheme = { isDarkTheme = !isDarkTheme }
-                )
-            }
+              MaterialTheme(
+        colorScheme = if (isDarkTheme) darkColors else lightColors
+    ) {
+        // Add this check BEFORE PvcAssistantScreen
+        if (classificationState is ClassificationScreenState.Ready) {
+            ContactClassificationScreen(
+                contacts = (classificationState as ClassificationScreenState.Ready).contacts,
+                selections = classificationSelections,
+                onSelect = classificationViewModel::setRelation,
+                onSave = classificationViewModel::saveAndFinish
+            )
+        } else {
+            PvcAssistantScreen(
+                viewModel = viewModel,
+                isDarkTheme = isDarkTheme,
+                onToggleTheme = { isDarkTheme = !isDarkTheme }
+            )
         }
     }
+    }
+}
 
     @Composable
     fun PvcAssistantScreen(
@@ -374,6 +389,14 @@ private fun checkMonitoringStatus(): String {
         "Service running, monitoring DMs: ${service.isMonitoring()}"
     } else {
         "Service not running"
+    }
+}
+private val classificationViewModel: ContactClassificationViewModel by viewModels {
+    object : ViewModelProvider.Factory {
+        override fun <T : ViewModel> create(modelClass: Class<T>): T {
+            @Suppress("UNCHECKED_CAST")
+            return ContactClassificationViewModel(application) as T
+        }
     }
 }
 
