@@ -28,7 +28,7 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
     private val contactDao = db.contactDao()
     private val appUsageDao = db.appUsageDao()
     private val relationDao = db.contactRelationDao()
-
+    private val remoteSyncHelper = RemoteSyncHelper(app)  
     private val _state = MutableStateFlow<ClassificationScreenState>(ClassificationScreenState.Loading)
     val state: StateFlow<ClassificationScreenState> = _state
 
@@ -78,19 +78,24 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
         _selections.value = _selections.value + (contactName to relation)
     }
 
-    fun saveAndFinish() {
-        viewModelScope.launch {
-            val now = System.currentTimeMillis()
-            _selections.value.forEach { (name, relation) ->
-                relationDao.upsert(
-                    ContactRelation_Entity(
-                        contactName = name,
-                        relation = relation.name,
-                        classifiedAtMs = now
-                    )
+fun onSelect(name: String, relation: ContactRelation) = setRelation(name, relation)
+
+
+ fun saveAndFinish() {
+    viewModelScope.launch {
+        val now = System.currentTimeMillis()
+        _selections.value.forEach { (name, relation) ->
+            relationDao.upsert(
+                ContactRelation_Entity(
+                    contactName = name,
+                    relation = relation.name,
+                    classifiedAtMs = now
                 )
-            }
-            _state.value = ClassificationScreenState.Done
+            )
+            remoteSyncHelper.syncContactRelation(name, relation)  // ADD THIS
         }
+        _state.value = ClassificationScreenState.Done
     }
+}
+fun saveClassifications() = saveAndFinish()
 }

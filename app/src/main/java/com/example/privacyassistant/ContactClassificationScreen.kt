@@ -40,14 +40,15 @@ private val columns = listOf(
     ContactRelation.UNKNOWN       to "Unknown"
 )
 
+
 @Composable
 fun ContactClassificationScreen(
-    contacts: List<ClassifiableContact>,
+    contacts: List<ClassifiableContact>,     
     selections: Map<String, ContactRelation>,
     onSelect: (String, ContactRelation) -> Unit,
     onSave: () -> Unit
 ) {
-    val saveEnabled = selections.size == contacts.size
+    val saveEnabled = contacts.isNotEmpty() && selections.size == contacts.size
 
     Box(
         modifier = Modifier

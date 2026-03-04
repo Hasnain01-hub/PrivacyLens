@@ -33,6 +33,14 @@ data class MessagePayload(
 data class ContactResponse(val ok: Boolean)
 data class MessageResponse(val id: Long?, val inserted: Boolean)
 
+data class ContactRelationPayload(
+    val contactKey: String,
+    val contactNameEnc: String,
+    val relationEnc: String,
+    val classifiedAtMs: Long
+)
+
+data class ContactRelationResponse(val ok: Boolean)
 // ── Retrofit interface ────────────────────────────────────────
 
 interface InstagramApiService {
@@ -48,6 +56,12 @@ interface InstagramApiService {
         @Body body: MessagePayload,
         @Header("Authorization") auth: String
     ): Response<MessageResponse>
+
+    @POST("/contact-relations")
+suspend fun upsertContactRelation(
+    @Body body: ContactRelationPayload,
+    @Header("Authorization") auth: String
+): Response<ContactRelationResponse>
 }
 
 // ── Singleton factory ─────────────────────────────────────────

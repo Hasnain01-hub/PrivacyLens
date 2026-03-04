@@ -132,8 +132,8 @@ class PvcAssistant : ComponentActivity() {
             ContactClassificationScreen(
                 contacts = (classificationState as ClassificationScreenState.Ready).contacts,
                 selections = classificationSelections,
-                onSelect = classificationViewModel::setRelation,
-                onSave = classificationViewModel::saveAndFinish
+                onSelect = { name, relation -> classificationViewModel.onSelect(name, relation) },
+                onSave = { classificationViewModel.saveClassifications() }
             )
         } else {
             PvcAssistantScreen(
