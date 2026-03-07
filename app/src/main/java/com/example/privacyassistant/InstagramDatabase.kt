@@ -43,7 +43,10 @@ object AssetType {
     const val GIF = "gif"
     const val STICKER = "sticker"
     const val VOICE_NOTE = "voice_note"
-    const val GIFT = "gift" 
+    const val GIFT = "gift"
+    const val REEL = "reel"
+    const val AUDIO_CALL = "audio_call"
+    const val VIDEO_CALL = "video_call"
 }
 
 @Entity(
@@ -61,7 +64,8 @@ data class Message(
     val groupLabelMessageId: Long? = null,
     val isSentByUser: Boolean = false,
     val assetType: String = AssetType.TEXT,
-    val fingerprint: String
+    val fingerprint: String,
+    val duration: String? = null
 )
 
 
@@ -127,7 +131,8 @@ interface MessageDao {
             time,
             groupLabelMessageId,
             isSentByUser,
-            assetType
+            assetType,
+            duration
         FROM messages
         ORDER BY id DESC
     """)
@@ -187,7 +192,8 @@ data class MessageWithReadableTime(
     val time: String?,
     val groupLabelMessageId: Long?,
     val isSentByUser: Boolean,
-    val assetType: String
+    val assetType: String,
+    val duration: String?
 ) {
     val readableTime: String
         get() = when {
@@ -199,7 +205,7 @@ data class MessageWithReadableTime(
 
 @Database(
     entities = [Contact::class, Message::class],
-    version = 11,
+    version = 12,
     exportSchema = true
 )
 @androidx.room.TypeConverters(TimeConverters::class)

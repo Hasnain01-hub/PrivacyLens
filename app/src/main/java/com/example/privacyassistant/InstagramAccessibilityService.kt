@@ -132,6 +132,25 @@ class InstagramAccessibilityService : AccessibilityService() {
                 else -> "EVENT_${event.eventType}"
             }
 
+            if (ULTRA_DEEP_LOGGING) {
+                Log.d(TAG, "🔔 EVENT: $eventTypeName | class=${event.className} | pkg=$packageName")
+                if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
+                    val cls = event.className?.toString() ?: ""
+                    val lower = cls.lowercase()
+                    if (lower.contains("reel") || lower.contains("clip") || lower.contains("video") ||
+                        lower.contains("call") || lower.contains("voip") || lower.contains("audio") ||
+                        lower.contains("ring") || lower.contains("phone")) {
+                        Log.d(TAG, "🎯 REEL/CALL ACTIVITY DETECTED: '$cls'")
+                        val root = rootInActiveWindow
+                        if (root != null) {
+                            Log.d(TAG, "🌳 DUMPING UI TREE FOR REEL/CALL SCREEN:")
+                            dumpUITree(root, maxDepth = 15)
+                            root.recycle()
+                        }
+                    }
+                }
+            }
+
             when (event.eventType) {
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
                     val className = event.className?.toString() ?: ""
@@ -302,10 +321,38 @@ private fun parseInstagramGroupLabel(
         return result(cal, hasTime = false)
     }
 
+    run {
+        val m = Regex("""^today\s+(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?$""", RegexOption.IGNORE_CASE).find(label)
+        if (m != null) {
+            var hh = m.groupValues[1].toInt()
+            val mm = m.groupValues[2].toInt()
+            val ampm = m.groupValues.getOrNull(3)?.lowercase()?.trim().orEmpty()
+            if (ampm == "pm" && hh in 1..11) hh += 12
+            if (ampm == "am" && hh == 12) hh = 0
+            val cal = setTime(nowCal, hh, mm)
+            return result(cal, hasTime = true)
+        }
+    }
+
     if (lower == "yesterday") {
         val cal = calAtNoon(nowCal)
         cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
         return result(cal, hasTime = false)
+    }
+
+    run {
+        val m = Regex("""^yesterday\s+(\d{1,2}):(\d{2})(?:\s*([AaPp][Mm]))?$""", RegexOption.IGNORE_CASE).find(label)
+        if (m != null) {
+            var hh = m.groupValues[1].toInt()
+            val mm = m.groupValues[2].toInt()
+            val ampm = m.groupValues.getOrNull(3)?.lowercase()?.trim().orEmpty()
+            if (ampm == "pm" && hh in 1..11) hh += 12
+            if (ampm == "am" && hh == 12) hh = 0
+            val cal = (nowCal.clone() as java.util.Calendar)
+            cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
+            val withTime = setTime(cal, hh, mm)
+            return result(withTime, hasTime = true)
+        }
     }
 
     run {
@@ -476,6 +523,8 @@ private fun collectUiTimestamps(rootNode: AccessibilityNodeInfo): List<UiTimesta
                 lower == "today" ||
                 lower == "yesterday" ||
                 lower == "last year" ||
+                Regex("""^today\s+\d{1,2}:\d{2}(\s*[AaPp][Mm])?$""", RegexOption.IGNORE_CASE).matches(s) ||
+                Regex("""^yesterday\s+\d{1,2}:\d{2}(\s*[AaPp][Mm])?$""", RegexOption.IGNORE_CASE).matches(s) ||
                 Regex("""^($dowNames)(\s+\d{1,2})?$""", RegexOption.IGNORE_CASE).matches(s) ||
                 Regex("""^($dowNames),?\s*\d{1,2}:\d{2}(\s*[AaPp][Mm])?$""", RegexOption.IGNORE_CASE).matches(s) ||
                 Regex("""^\d{1,2}\s+($monthNames)\w*\s+\d{4}$""", RegexOption.IGNORE_CASE).matches(s) ||
@@ -860,6 +909,12 @@ private suspend fun captureNewMessages() {
         val rootNode = rootInActiveWindow ?: return
         val contactName = currentChatContact ?: "Unknown"
 
+        if (ULTRA_DEEP_LOGGING) {
+            Log.d(TAG, "🌳 === FULL UI TREE DUMP (chat with '$contactName') ===")
+            dumpUITree(rootNode)
+            Log.d(TAG, "🌳 === END UI TREE DUMP ===")
+        }
+
         val detectedMessages = findMessageNodes(rootNode)
 
         if (detectedMessages.isEmpty()) {
@@ -1040,11 +1095,16 @@ private suspend fun captureNewMessages() {
                 val msgTime = if (shouldBeFirst) label.parsedTime else null
                 val msgGroupRef = if (shouldBeFirst) null else firstId
 
+                val msgDuration = if (mi.assetType == AssetType.VOICE_NOTE) {
+                    Regex("""\((\d+:\d{2})\)""").find(mi.detected.text)?.groupValues?.get(1)
+                } else null
+
                 val message = Message(
                     id = 0, contactName = contactName, messageText = mi.messageText,
                     date = label.parsedDate, time = msgTime, groupLabelMessageId = msgGroupRef,
                     isSentByUser = mi.isSentByUser,
-                    assetType = mi.assetType, fingerprint = fp
+                    assetType = mi.assetType, fingerprint = fp,
+                    duration = msgDuration
                 )
 
                 val messageId = messageDao.insert(message)
@@ -1089,11 +1149,16 @@ private suspend fun captureNewMessages() {
                 sha256("$contactName|m|${mi.assetType}|${mi.isSentByUser}|$d|$fallbackDate||$mediaOrd")
             }
 
+            val msgDuration = if (mi.assetType == AssetType.VOICE_NOTE) {
+                Regex("""\((\d+:\d{2})\)""").find(mi.detected.text)?.groupValues?.get(1)
+            } else null
+
             val message = Message(
                 id = 0, contactName = contactName, messageText = mi.messageText,
                 date = fallbackDate, time = fallbackTime, groupLabelMessageId = null,
                 isSentByUser = mi.isSentByUser,
-                assetType = mi.assetType, fingerprint = fp
+                assetType = mi.assetType, fingerprint = fp,
+                duration = msgDuration
             )
 
             val messageId = messageDao.insert(message)
@@ -1120,7 +1185,7 @@ private suspend fun captureNewMessages() {
     }
 }
 
-    private fun dumpUITree(node: AccessibilityNodeInfo?, depth: Int = 0, maxDepth: Int = 10) {
+    private fun dumpUITree(node: AccessibilityNodeInfo?, depth: Int = 0, maxDepth: Int = 15) {
         if (node == null || depth > maxDepth) return
 
         val indent = "  ".repeat(depth)
@@ -1128,16 +1193,17 @@ private suspend fun captureNewMessages() {
         val contentDesc = node.contentDescription?.toString() ?: ""
         val viewId = node.viewIdResourceName?.substringAfterLast(':') ?: ""
         val className = node.className?.toString()?.substringAfterLast('.') ?: ""
+        val bounds = android.graphics.Rect()
+        node.getBoundsInScreen(bounds)
 
-        if (text.isNotEmpty() || viewId.isNotEmpty() || contentDesc.isNotEmpty()) {
-            val info = StringBuilder()
-            info.append("$indent[$className]")
-            if (viewId.isNotEmpty()) info.append(" ID:$viewId")
-            if (text.isNotEmpty()) info.append(" Text:'${text.take(50)}'")
-            if (contentDesc.isNotEmpty()) info.append(" Desc:'${contentDesc.take(50)}'")
+        val info = StringBuilder()
+        info.append("$indent[$className]")
+        if (viewId.isNotEmpty()) info.append(" ID:$viewId")
+        if (text.isNotEmpty()) info.append(" Text:'${text.take(80)}'")
+        if (contentDesc.isNotEmpty()) info.append(" Desc:'${contentDesc.take(80)}'")
+        info.append(" bounds=(${bounds.left},${bounds.top},${bounds.right},${bounds.bottom})")
 
-            Log.d(TAG, info.toString())
-        }
+        Log.d(TAG, info.toString())
 
         for (i in 0 until node.childCount) {
             node.getChild(i)?.let { child ->
@@ -1201,6 +1267,7 @@ private suspend fun captureNewMessages() {
             }
 
             val timePattern = Regex("^\\d{1,2}:\\d{2}$")
+            val timestampWithPrefix = Regex("^(today|yesterday|mon|tue|tues|wed|thu|thur|thurs|fri|sat|sun|monday|tuesday|wednesday|thursday|friday|saturday|sunday)\\s+\\d{1,2}:\\d{2}(\\s*[AaPp][Mm])?$", RegexOption.IGNORE_CASE)
             val paginationPattern = Regex("^\\d+/\\d+$")
 
             val isValidContact = text.length in 3..30 &&
@@ -1229,7 +1296,14 @@ private suspend fun captureNewMessages() {
                 text.count { it == ' ' } <= 1 &&
                 !text.all { it.isDigit() } &&
                 !timePattern.matches(text) &&
+                !timestampWithPrefix.matches(text) &&
                 !paginationPattern.matches(text) &&
+                !text.startsWith("Today", ignoreCase = true) &&
+                !text.startsWith("Yesterday", ignoreCase = true) &&
+                !text.equals("Call back", ignoreCase = true) &&
+                !text.contains("call started", ignoreCase = true) &&
+                !text.contains("call ended", ignoreCase = true) &&
+                !text.contains("Missed", ignoreCase = true) &&
                 text != "@"
 
             if ((matchesViewIdPattern || matchesClassPattern) && isValidContact) {
@@ -1453,6 +1527,86 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
             val contentDesc = node.contentDescription?.toString() ?: ""
             val text = node.text?.toString() ?: ""
             val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
+
+            if (ULTRA_DEEP_LOGGING) {
+                val allLower = "$contentDesc $text $viewIdShort".lowercase()
+                if (allLower.contains("reel") || allLower.contains("clip") ||
+                    allLower.contains("call") || allLower.contains("voip") ||
+                    allLower.contains("missed") || allLower.contains("rang") ||
+                    allLower.contains("ended") || allLower.contains("duration") ||
+                    allLower.contains("shared a reel") || allLower.contains("sent a reel")) {
+                    val bounds = android.graphics.Rect()
+                    node.getBoundsInScreen(bounds)
+                    Log.d(TAG, "🎯 REEL/CALL NODE: viewId='$viewIdShort' class='${className.substringAfterLast('.')}' desc='${contentDesc.take(80)}' text='${text.take(80)}' pos=(${bounds.left},${bounds.top})")
+                }
+            }
+
+            if (viewIdShort.equals("reel_share_item_view", ignoreCase = true)) {
+                val bounds = android.graphics.Rect()
+                node.getBoundsInScreen(bounds)
+                val reelId = "reel-${bounds.top}-${bounds.left}"
+
+                if (!processedMediaIds.contains(reelId)) {
+                    processedMediaIds.add(reelId)
+
+                    val reelDesc = if (contentDesc.isNotBlank()) contentDesc else "Shared a reel"
+
+                    messages.add(
+                        DetectedMessage(
+                            text = reelDesc,
+                            assetType = AssetType.REEL,
+                            node = AccessibilityNodeInfo.obtain(node)
+                        )
+                    )
+                    Log.d(TAG, "🎬 REEL DETECTED: '$reelDesc' at pos(${bounds.left},${bounds.top})")
+                }
+                return
+            }
+
+            if (viewIdShort.equals("call_state_icon", ignoreCase = true)) {
+                val parent = node.parent
+                if (parent != null) {
+                    var callTitle: String? = null
+                    var callTime: String? = null
+
+                    for (i in 0 until parent.childCount) {
+                        val sibling = parent.getChild(i) ?: continue
+                        val sibViewId = sibling.viewIdResourceName?.substringAfterLast('/').orEmpty().substringAfterLast(':')
+                        if (sibViewId.equals("title", ignoreCase = true) && sibling.text != null) {
+                            callTitle = sibling.text.toString().trim()
+                        }
+                        if (sibViewId.equals("subtitle", ignoreCase = true) && sibling.text != null) {
+                            callTime = sibling.text.toString().trim()
+                        }
+                        sibling.recycle()
+                    }
+
+                    if (callTitle != null && callTitle.contains("started", ignoreCase = true)) {
+                        val bounds = android.graphics.Rect()
+                        node.getBoundsInScreen(bounds)
+                        val callId = "call-${bounds.top}-${bounds.left}"
+
+                        if (!processedMediaIds.contains(callId)) {
+                            processedMediaIds.add(callId)
+
+                            val callText = if (callTime != null) "$callTitle ($callTime)" else callTitle
+                            val callAssetType = if (callTitle.contains("video", ignoreCase = true)) AssetType.VIDEO_CALL else AssetType.AUDIO_CALL
+
+                            messages.add(
+                                DetectedMessage(
+                                    text = callText,
+                                    assetType = callAssetType,
+                                    node = AccessibilityNodeInfo.obtain(node)
+                                )
+                            )
+                            Log.d(TAG, "📞 CALL DETECTED [$callAssetType]: '$callText' at pos(${bounds.left},${bounds.top})")
+                        }
+                    }
+                    parent.recycle()
+                }
+                return
+            }
+
             val looksLikeGift = nodeContainsGiftKeyword(node)
 
                         if (looksLikeGift) {
@@ -1525,8 +1679,9 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                 val mediaId = "voice_note-${bounds.top}-${bounds.left}"
                 if (!processedMediaIds.contains(mediaId)) {
                     processedMediaIds.add(mediaId)
-                    Log.d(TAG, "🎤 VOICE MESSAGE DETECTED: viewId='$viewIdShort' pos=(${bounds.left},${bounds.top})")
-                    val voiceText = "Voice message"
+                    val durationText = text.takeIf { it.isNotBlank() }
+                    Log.d(TAG, "🎤 VOICE MESSAGE DETECTED: viewId='$viewIdShort' text='$text' duration='$durationText' pos=(${bounds.left},${bounds.top})")
+                    val voiceText = if (durationText != null) "Voice message ($durationText)" else "Voice message"
                     messages.add(DetectedMessage(
                         text = voiceText,
                         assetType = AssetType.VOICE_NOTE,
@@ -1583,6 +1738,7 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                     !text.contains("Like", ignoreCase = true) &&
                     !text.contains("Camera", ignoreCase = true) &&
                     !text.contains("Voice", ignoreCase = true) &&
+                    !text.equals("Call back", ignoreCase = true) &&
                     !text.contains("Tap and hold", ignoreCase = true) &&
                     !text.contains("Seen just now", ignoreCase = true) &&
                     !text.contains("Seen", ignoreCase = true) &&
