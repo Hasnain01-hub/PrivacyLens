@@ -297,6 +297,11 @@ private fun parseInstagramGroupLabel(
         return result(cal, hasTime = true)
     }
 
+    if (lower == "today") {
+        val cal = calAtNoon(nowCal)
+        return result(cal, hasTime = false)
+    }
+
     if (lower == "yesterday") {
         val cal = calAtNoon(nowCal)
         cal.add(java.util.Calendar.DAY_OF_YEAR, -1)
@@ -468,6 +473,7 @@ private fun collectUiTimestamps(rootNode: AccessibilityNodeInfo): List<UiTimesta
         val monthNames = "jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec"
 
         return Regex("""^\d{1,2}:\d{2}(\s*[AaPp][Mm])?$""").matches(s) ||
+                lower == "today" ||
                 lower == "yesterday" ||
                 lower == "last year" ||
                 Regex("""^($dowNames)(\s+\d{1,2})?$""", RegexOption.IGNORE_CASE).matches(s) ||
@@ -1010,13 +1016,13 @@ private suspend fun captureNewMessages() {
                 val isTopmost = (index == 0)
 
                 val fp: String = if (mi.assetType == AssetType.TEXT) {
-                    sha256("$contactName|t|${mi.isSentByUser}|${mi.messageText.trim()}|${label.parsedDate}|${label.parsedTime ?: ""}")
+                    sha256("$contactName|t|${mi.isSentByUser}|${mi.messageText.trim()}|${label.parsedDate}|")
                 } else {
                     val mediaOrd = sortedByY.take(index + 1).count {
                         it.mi.assetType == mi.assetType && it.mi.isSentByUser == mi.isSentByUser
                     } - 1
                     val d = normalizeDesc(mi.detected.text.orEmpty())
-                    sha256("$contactName|m|${mi.assetType}|${mi.isSentByUser}|$d|${label.parsedDate}|${label.parsedTime ?: ""}|$mediaOrd")
+                    sha256("$contactName|m|${mi.assetType}|${mi.isSentByUser}|$d|${label.parsedDate}||$mediaOrd")
                 }
 
                 val pendingKey = "${contactName}|${mi.isSentByUser}|${mi.assetType}|${mi.messageText.trim()}"
@@ -1066,23 +1072,35 @@ private suspend fun captureNewMessages() {
             }
         }
 
+        val nowForFallback = java.util.Date()
+        val fallbackDateFmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
+        val fallbackTimeFmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+        val fallbackDate = fallbackDateFmt.format(nowForFallback)
+        val fallbackTime = fallbackTimeFmt.format(nowForFallback)
+
         withoutLabel.forEach { lm ->
             val mi = lm.mi
-            val pendingKey = "${contactName}|${mi.isSentByUser}|${mi.assetType}|${mi.messageText.trim()}"
-            if (pendingKey !in pendingMessages) {
-                pendingMessages[pendingKey] = PendingMessage(
-                    contactName = contactName,
-                    messageText = mi.messageText,
-                    isSentByUser = mi.isSentByUser,
-                    assetType = mi.assetType,
-                    detectedDesc = mi.detected.text,
-                    firstSeenMs = System.currentTimeMillis()
-                )
-                if (ULTRA_DEEP_LOGGING) {
-                    Log.d(TAG, "  ⏳ DEFERRED (no label): '${mi.messageText.take(50)}' [${mi.assetType}]")
-                }
-            } else if (ULTRA_DEEP_LOGGING) {
-                Log.d(TAG, "  ⏳ STILL PENDING: '${mi.messageText.take(50)}' [${mi.assetType}]")
+
+            val fp: String = if (mi.assetType == AssetType.TEXT) {
+                sha256("$contactName|t|${mi.isSentByUser}|${mi.messageText.trim()}|$fallbackDate|")
+            } else {
+                val d = normalizeDesc(mi.detected.text.orEmpty())
+                val mediaOrd = withoutLabel.indexOf(lm)
+                sha256("$contactName|m|${mi.assetType}|${mi.isSentByUser}|$d|$fallbackDate||$mediaOrd")
+            }
+
+            val message = Message(
+                id = 0, contactName = contactName, messageText = mi.messageText,
+                date = fallbackDate, time = fallbackTime, groupLabelMessageId = null,
+                isSentByUser = mi.isSentByUser,
+                assetType = mi.assetType, fingerprint = fp
+            )
+
+            val messageId = messageDao.insert(message)
+            if (messageId != -1L) {
+                newMessageCount++
+                val direction = if (mi.isSentByUser) "SENT" else "RECEIVED"
+                Log.d(TAG, "  ✅ SAVED [${mi.assetType}-nolabel] [$direction]: '${mi.detected.text.take(50)}' (ID: $messageId, date=$fallbackDate, time=$fallbackTime)")
             }
         }
 
