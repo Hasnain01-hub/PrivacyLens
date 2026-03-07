@@ -1043,7 +1043,7 @@ private suspend fun captureNewMessages() {
             uiTimestamps.forEach { ts ->
                 Log.d(TAG, "   📅 '${ts.raw}' y=${ts.y} date=${ts.parsedDate} time=${ts.parsedTime}")
             }
-            Log.d(TAG, "   Pending buffer size: ${pendingMessages.size}")
+            Log.d(TAG, "   No-label messages: ${withoutLabel.size} (skipped)")
         }
 
         val byLabelKey = withLabel.groupBy { lm ->
@@ -1079,10 +1079,6 @@ private suspend fun captureNewMessages() {
                     val d = normalizeDesc(mi.detected.text.orEmpty())
                     sha256("$contactName|m|${mi.assetType}|${mi.isSentByUser}|$d|${label.parsedDate}||$mediaOrd")
                 }
-
-                val pendingKey = "${contactName}|${mi.isSentByUser}|${mi.assetType}|${mi.messageText.trim()}"
-                val wasPending = pendingKey in pendingMessages
-                if (wasPending) pendingMessages.remove(pendingKey)
 
                 val shouldBeFirst = if (firstId == null) {
                     true
@@ -1120,9 +1116,8 @@ private suspend fun captureNewMessages() {
                         firstId = messageId
                     }
 
-                    val tag = if (wasPending) "${mi.assetType}-flushed" else mi.assetType
                     val direction = if (mi.isSentByUser) "SENT" else "RECEIVED"
-                    Log.d(TAG, "  ✅ SAVED [$tag] [$direction]: '${mi.detected.text.take(50)}' (ID: $messageId, date=${label.parsedDate}, time=$msgTime, groupRef=$msgGroupRef)")
+                    Log.d(TAG, "  ✅ SAVED [${mi.assetType}] [$direction]: '${mi.detected.text.take(50)}' (ID: $messageId, date=${label.parsedDate}, time=$msgTime, groupRef=$msgGroupRef)")
                 } else {
                     if (firstId == null) {
                         val existingId = messageDao.getIdByFingerprint(contactName, fp)
@@ -1132,41 +1127,8 @@ private suspend fun captureNewMessages() {
             }
         }
 
-        val nowForFallback = java.util.Date()
-        val fallbackDateFmt = java.text.SimpleDateFormat("yyyy-MM-dd", java.util.Locale.getDefault())
-        val fallbackTimeFmt = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
-        val fallbackDate = fallbackDateFmt.format(nowForFallback)
-        val fallbackTime = fallbackTimeFmt.format(nowForFallback)
-
-        withoutLabel.forEach { lm ->
-            val mi = lm.mi
-
-            val fp: String = if (mi.assetType == AssetType.TEXT) {
-                sha256("$contactName|t|${mi.isSentByUser}|${mi.messageText.trim()}|$fallbackDate|")
-            } else {
-                val d = normalizeDesc(mi.detected.text.orEmpty())
-                val mediaOrd = withoutLabel.indexOf(lm)
-                sha256("$contactName|m|${mi.assetType}|${mi.isSentByUser}|$d|$fallbackDate||$mediaOrd")
-            }
-
-            val msgDuration = if (mi.assetType == AssetType.VOICE_NOTE) {
-                Regex("""\((\d+:\d{2})\)""").find(mi.detected.text)?.groupValues?.get(1)
-            } else null
-
-            val message = Message(
-                id = 0, contactName = contactName, messageText = mi.messageText,
-                date = fallbackDate, time = fallbackTime, groupLabelMessageId = null,
-                isSentByUser = mi.isSentByUser,
-                assetType = mi.assetType, fingerprint = fp,
-                duration = msgDuration
-            )
-
-            val messageId = messageDao.insert(message)
-            if (messageId != -1L) {
-                newMessageCount++
-                val direction = if (mi.isSentByUser) "SENT" else "RECEIVED"
-                Log.d(TAG, "  ✅ SAVED [${mi.assetType}-nolabel] [$direction]: '${mi.detected.text.take(50)}' (ID: $messageId, date=$fallbackDate, time=$fallbackTime)")
-            }
+        if (withoutLabel.isNotEmpty() && ULTRA_DEEP_LOGGING) {
+            Log.d(TAG, "  ⏭️ SKIPPED ${withoutLabel.size} messages without label (will capture on next scan with label)")
         }
 
         msgInfos.forEach { mi ->
@@ -1474,9 +1436,17 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
 
 
 
+    data class RawCallEntry(
+        val title: String,
+        val time: String?,
+        val y: Int,
+        val node: AccessibilityNodeInfo
+    )
+
     private fun findMessageNodes(rootNode: AccessibilityNodeInfo): List<DetectedMessage> {
         val messages = mutableListOf<DetectedMessage>()
         val processedMediaIds = mutableSetOf<String>()
+        val rawCallEntries = mutableListOf<RawCallEntry>()
 
         val messageViewIdPatterns = listOf(
             "direct_text_message_text_view",
@@ -1581,25 +1551,20 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                         sibling.recycle()
                     }
 
-                    if (callTitle != null && callTitle.contains("started", ignoreCase = true)) {
+                    if (callTitle != null) {
                         val bounds = android.graphics.Rect()
                         node.getBoundsInScreen(bounds)
                         val callId = "call-${bounds.top}-${bounds.left}"
 
                         if (!processedMediaIds.contains(callId)) {
                             processedMediaIds.add(callId)
-
-                            val callText = if (callTime != null) "$callTitle ($callTime)" else callTitle
-                            val callAssetType = if (callTitle.contains("video", ignoreCase = true)) AssetType.VIDEO_CALL else AssetType.AUDIO_CALL
-
-                            messages.add(
-                                DetectedMessage(
-                                    text = callText,
-                                    assetType = callAssetType,
-                                    node = AccessibilityNodeInfo.obtain(node)
-                                )
-                            )
-                            Log.d(TAG, "📞 CALL DETECTED [$callAssetType]: '$callText' at pos(${bounds.left},${bounds.top})")
+                            rawCallEntries.add(RawCallEntry(
+                                title = callTitle,
+                                time = callTime,
+                                y = bounds.centerY(),
+                                node = AccessibilityNodeInfo.obtain(node)
+                            ))
+                            Log.d(TAG, "📞 CALL ENTRY: '$callTitle' time='$callTime' y=${bounds.centerY()}")
                         }
                     }
                     parent.recycle()
@@ -1790,6 +1755,26 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
         }
 
         searchNodes(rootNode)
+
+        // Process call entries: only keep "started" ones
+        for (entry in rawCallEntries) {
+            if (entry.title.contains("started", ignoreCase = true)) {
+                val callAssetType = if (entry.title.contains("video", ignoreCase = true)) AssetType.VIDEO_CALL else AssetType.AUDIO_CALL
+                val callText = if (entry.time != null) "${entry.title} (${entry.time})" else entry.title
+
+                messages.add(
+                    DetectedMessage(
+                        text = callText,
+                        assetType = callAssetType,
+                        node = AccessibilityNodeInfo.obtain(entry.node)
+                    )
+                )
+                Log.d(TAG, "📞 CALL DETECTED [$callAssetType]: '$callText'")
+            }
+        }
+
+        rawCallEntries.forEach { try { it.node.recycle() } catch (_: Exception) {} }
+
         return messages
     }
 
