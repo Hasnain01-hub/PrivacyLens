@@ -13,3 +13,6 @@
 .externalNativeBuild
 .cxx
 local.properties
+doc.txt
+privacy-instance.pem
+privacy-instance1.pem

@@ -203,18 +203,74 @@ data class MessageWithReadableTime(
         }
 }
 
-// Data class for messages with readable timestamp
+data class MediaTypeCount(
+    val assetType: String,
+    val isSentByUser: Boolean,
+    val cnt: Int
+)
+
 data class MessageWithReadableTime(
-      val id: Long,
+    val id: Long,
     val contactName: String,
     val messageText: String?,
-    val timestamp: Long,
-    val readableTime: String,  // e.g., "2024-12-30 16:15:17"
+    val date: String?,
+    val time: String?,
+    val groupLabelMessageId: Long?,
     val isSentByUser: Boolean,
-    val assetType: String,
-    val replyMessage: String?,
-    val replyMessageID: Long?
+    val assetType: String
+) {
+    val readableTime: String
+        get() = when {
+            date != null && time != null -> "$date $time"
+            date != null -> date
+            else -> "unknown"
+        }
+}
+// ── Usage tracking (first/last open) ────────────────────────
+@Entity(tableName = "app_usage")
+data class AppUsage(
+    @PrimaryKey val id: Int = 1, // singleton row
+    val firstOpenMs: Long,
+    val lastOpenMs: Long,
+    val lastClassifiedMs: Long = 0L
 )
+
+@Dao
+interface AppUsageDao {
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(usage: AppUsage)
+
+    @Query("UPDATE app_usage SET lastOpenMs = :now WHERE id = 1")
+    suspend fun updateLastOpen(now: Long)
+    
+    @Query("UPDATE app_usage SET lastClassifiedMs = :time WHERE id = 1")
+    suspend fun updateLastClassified(time: Long)
+
+    @Query("SELECT * FROM app_usage WHERE id = 1")
+    suspend fun get(): AppUsage?
+}
+
+// ── Contact classification ───────────────────────────────────
+enum class ContactRelation { FRIEND, MUTUAL_FRIEND, FAMILY, UNKNOWN }
+
+@Entity(tableName = "contact_relations")
+data class ContactRelation_Entity(
+    @PrimaryKey val contactName: String,
+    val relation: String,           // stores ContactRelation.name
+    val classifiedAtMs: Long = System.currentTimeMillis()
+)
+
+@Dao
+interface ContactRelationDao {
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsert(entry: ContactRelation_Entity)
+
+    @Query("SELECT contactName FROM contact_relations")
+    suspend fun getAllClassifiedNames(): List<String>
+
+    @Query("SELECT * FROM contact_relations")
+    suspend fun getAll(): List<ContactRelation_Entity>
+}
 
 @Database(
     entities = [Contact::class, Message::class],
@@ -225,7 +281,9 @@ data class MessageWithReadableTime(
 abstract class InstagramDatabase : androidx.room.RoomDatabase(){
     abstract fun contactDao(): ContactDao
     abstract fun messageDao(): MessageDao
-    
+    abstract fun appUsageDao(): AppUsageDao
+    abstract fun contactRelationDao(): ContactRelationDao
+
     companion object {
         @Volatile
         private var INSTANCE: InstagramDatabase? = null
