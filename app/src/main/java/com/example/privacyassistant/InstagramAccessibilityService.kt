@@ -1753,7 +1753,6 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
             }
 
             for (i in 0 until node.childCount) {
-                if (quotedMessageText != null) return  // Already found, stop
                 node.getChild(i)?.let { child ->
                     searchNodes(child, depth + 1)
                     child.recycle()
