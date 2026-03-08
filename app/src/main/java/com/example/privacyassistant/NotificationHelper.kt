@@ -11,7 +11,8 @@ import androidx.core.app.NotificationCompat
 class NotificationHelper(private val context: Context) {
 
     private val channelId = "privacy_warning_channel"
-    private val notificationId = 1
+    private val postNotificationId = 1
+    private val classificationNotificationId = 2
 
     init {
         createNotificationChannel()
@@ -31,16 +32,41 @@ class NotificationHelper(private val context: Context) {
 
     fun showInstagramPostAssistantNotification() {
         showNotification(
+            id = postNotificationId,
             title = "Instagram Post Assistant",
             text = "Let me help you minimize privacy risks!",
             targetActivity = PvcAssistant::class.java
         )
     }
 
-    private fun showNotification(title: String, text: String, targetActivity: Class<*>) {
+    fun showContactClassificationNotification() {
+        val intent = Intent(context, PvcAssistant::class.java).apply {
+            putExtra("show_classification", true)
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            classificationNotificationId,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        val notification = NotificationCompat.Builder(context, channelId)
+            .setContentTitle("Let's minimize privacy risks")
+            .setContentText("Click here to classify your contacts")
+            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setPriority(NotificationCompat.PRIORITY_HIGH)
+            .setContentIntent(pendingIntent)
+            .setAutoCancel(true)
+            .build()
+
+        notificationManager.notify(classificationNotificationId, notification)
+    }
+
+    private fun showNotification(id: Int, title: String, text: String, targetActivity: Class<*>) {
         val notificationManager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
 
-        // Intent to open target activity when notification is tapped
         val intent = Intent(context, targetActivity)
         val pendingIntent = PendingIntent.getActivity(
             context,
@@ -49,7 +75,6 @@ class NotificationHelper(private val context: Context) {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        // Build the notification
         val notification = NotificationCompat.Builder(context, channelId)
             .setContentTitle(title)
             .setContentText(text)
@@ -59,6 +84,6 @@ class NotificationHelper(private val context: Context) {
             .setAutoCancel(true)
             .build()
 
-        notificationManager.notify(notificationId, notification)
+        notificationManager.notify(id, notification)
     }
 }

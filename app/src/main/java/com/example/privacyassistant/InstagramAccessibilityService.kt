@@ -39,6 +39,8 @@ class InstagramAccessibilityService : AccessibilityService() {
     private lateinit var database: InstagramDatabase
     private lateinit var contactDao: ContactDao
     private lateinit var messageDao: MessageDao
+    private lateinit var appUsageDao: AppUsageDao
+    private lateinit var relationDao: ContactRelationDao
     private lateinit var remoteSyncHelper: RemoteSyncHelper
     private lateinit var notificationHelper: NotificationHelper
     private val ioScope = CoroutineScope(Dispatchers.IO)
@@ -68,9 +70,11 @@ class InstagramAccessibilityService : AccessibilityService() {
     private var lastMessageCaptureTime = 0L
     private var lastContactCaptureTime = 0L
     private var lastPostDetectionTime = 0L
+    private var classificationCheckJob: kotlinx.coroutines.Job? = null
     private val MESSAGE_CAPTURE_DEBOUNCE_MS = 500L
     private val CONTACT_CAPTURE_DEBOUNCE_MS = 2000L
     private val POST_DETECTION_DEBOUNCE_MS = 3000L
+    private val CLASSIFICATION_CHECK_INTERVAL_MS = 60_000L // 1 min for testing
 
     override fun onServiceConnected() {
     super.onServiceConnected()
@@ -103,6 +107,8 @@ class InstagramAccessibilityService : AccessibilityService() {
     database = InstagramDatabase.getInstance(applicationContext)
     contactDao = database.contactDao()
     messageDao = database.messageDao()
+    appUsageDao = database.appUsageDao()
+    relationDao = database.contactRelationDao()
 
     ioScope.launch {
         try {
@@ -117,7 +123,39 @@ class InstagramAccessibilityService : AccessibilityService() {
     }
 
     Log.d(TAG, "Service initialized and ready to monitor Instagram")
+
+    // Start periodic classification notification check
+    startClassificationCheckLoop()
 }
+
+    private fun startClassificationCheckLoop() {
+        classificationCheckJob?.cancel()
+        classificationCheckJob = ioScope.launch {
+            while (true) {
+                delay(CLASSIFICATION_CHECK_INTERVAL_MS)
+                try {
+                    val allContacts = contactDao.getAllContacts()
+                    if (allContacts.isEmpty()) {
+                        Log.d(TAG, "Classification check: no contacts captured yet, skipping")
+                        continue
+                    }
+
+                    val alreadyClassified = relationDao.getAllClassifiedNames().toSet()
+                    val unclassified = allContacts.filter { it.name !in alreadyClassified }
+
+                    if (unclassified.isEmpty()) {
+                        Log.d(TAG, "Classification check: all ${allContacts.size} contacts already classified")
+                        continue
+                    }
+
+                    Log.d(TAG, "Classification check: ${unclassified.size} unclassified contacts found, showing notification")
+                    notificationHelper.showContactClassificationNotification()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Classification check error: ${e.message}")
+                }
+            }
+        }
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
         try {
@@ -1204,11 +1242,8 @@ private suspend fun captureNewMessages() {
     val contactPatterns = listOf(
         "row_thread_user_name",
         "direct_thread_title",
-        "thread_title",
         "inbox_row_username",
-        "direct_inbox_row_user_name",
-        "action_bar_title",
-        "header_title"
+        "direct_inbox_row_user_name"
     )
 
     fun searchNodes(node: AccessibilityNodeInfo, depth: Int = 0) {
@@ -1258,6 +1293,11 @@ private suspend fun captureNewMessages() {
                 !text.contains("call started", ignoreCase = true) &&
                 !text.contains("call ended", ignoreCase = true) &&
                 !text.contains("Missed", ignoreCase = true) &&
+                !text.equals("Reels", ignoreCase = true) &&
+                !text.equals("Explore", ignoreCase = true) &&
+                !text.equals("Home", ignoreCase = true) &&
+                !text.equals("Profile", ignoreCase = true) &&
+                !text.equals("Shop", ignoreCase = true) &&
                 text != "@"
 
             if (matchesViewIdPattern && isValidContact) {
@@ -1900,6 +1940,7 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
     }
 
     override fun onDestroy() {
+        classificationCheckJob?.cancel()
         instance = null
         Log.d(TAG, "Service destroyed")
         super.onDestroy()

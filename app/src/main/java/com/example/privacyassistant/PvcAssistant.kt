@@ -112,6 +112,11 @@ class PvcAssistant : ComponentActivity() {
         viewModel = dbHandler.createViewModel(this)
         user = UserHelper(-1, -1, -1, -1, -1, -1)
 
+        // If opened from classification notification, bypass time check
+        if (intent?.getBooleanExtra("show_classification", false) == true) {
+            classificationViewModel.forceShowClassification()
+        }
+
         setContent {
         val classificationState by classificationViewModel.state.collectAsState()
         val classificationSelections by classificationViewModel.selections.collectAsState()

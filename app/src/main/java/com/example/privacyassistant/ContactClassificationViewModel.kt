@@ -41,25 +41,25 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     init {
-        viewModelScope.launch { bootstrap() }
+        viewModelScope.launch { bootstrap(skipTimeCheck = false) }
     }
 
-    private suspend fun bootstrap() {
+    private suspend fun bootstrap(skipTimeCheck: Boolean) {
     val now = System.currentTimeMillis()
 
     appUsageDao.insertIfAbsent(AppUsage(firstOpenMs = now, lastOpenMs = now))
     appUsageDao.updateLastOpen(now)
 
-    val usage = appUsageDao.get() ?: return
+    if (!skipTimeCheck) {
+        val usage = appUsageDao.get() ?: return
+        val referenceTime = if (usage.lastClassifiedMs > 0L) usage.lastClassifiedMs
+                            else usage.firstOpenMs
+        val elapsed = now - referenceTime
 
-    // Use lastClassifiedMs if it exists, otherwise fall back to firstOpenMs
-    val referenceTime = if (usage.lastClassifiedMs > 0L) usage.lastClassifiedMs 
-                        else usage.firstOpenMs
-    val elapsed = now - referenceTime
-
-    if (elapsed < ONE_MONTH_MS) {
-        _state.value = ClassificationScreenState.NotDueYet
-        return
+        if (elapsed < ONE_MONTH_MS) {
+            _state.value = ClassificationScreenState.NotDueYet
+            return
+        }
     }
 
     val alreadyDone = relationDao.getAllClassifiedNames().toSet()
@@ -75,6 +75,10 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
         pending.map { ClassifiableContact(it) }
     )
 }
+
+    fun forceShowClassification() {
+        viewModelScope.launch { bootstrap(skipTimeCheck = true) }
+    }
 
     fun setRelation(contactName: String, relation: ContactRelation) {
         _selections.value = _selections.value + (contactName to relation)
