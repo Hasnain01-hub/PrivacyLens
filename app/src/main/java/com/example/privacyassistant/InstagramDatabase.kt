@@ -203,29 +203,6 @@ data class MessageWithReadableTime(
         }
 }
 
-data class MediaTypeCount(
-    val assetType: String,
-    val isSentByUser: Boolean,
-    val cnt: Int
-)
-
-data class MessageWithReadableTime(
-    val id: Long,
-    val contactName: String,
-    val messageText: String?,
-    val date: String?,
-    val time: String?,
-    val groupLabelMessageId: Long?,
-    val isSentByUser: Boolean,
-    val assetType: String
-) {
-    val readableTime: String
-        get() = when {
-            date != null && time != null -> "$date $time"
-            date != null -> date
-            else -> "unknown"
-        }
-}
 // ── Usage tracking (first/last open) ────────────────────────
 @Entity(tableName = "app_usage")
 data class AppUsage(
@@ -273,9 +250,9 @@ interface ContactRelationDao {
 }
 
 @Database(
-    entities = [Contact::class, Message::class],
+    entities = [Contact::class, Message::class, AppUsage::class, ContactRelation_Entity::class],
     version = 12,
-    exportSchema = true
+    exportSchema = false
 )
 @androidx.room.TypeConverters(TimeConverters::class)
 abstract class InstagramDatabase : androidx.room.RoomDatabase(){
