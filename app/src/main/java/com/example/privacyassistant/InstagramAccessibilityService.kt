@@ -1204,10 +1204,6 @@ private suspend fun captureNewMessages() {
     val contactPatterns = listOf(
         "row_thread_user_name",
         "direct_thread_title",
-        "title",
-        "username",
-        "name",
-        "user_name",
         "thread_title",
         "inbox_row_username",
         "direct_inbox_row_user_name",
@@ -1215,23 +1211,13 @@ private suspend fun captureNewMessages() {
         "header_title"
     )
 
-    val classPatterns = listOf(
-        "TextView",
-        "AppCompatTextView"
-    )
-
     fun searchNodes(node: AccessibilityNodeInfo, depth: Int = 0) {
         if (node.text != null && node.text.isNotEmpty()) {
             val text = node.text.toString().trim()
             val viewId = node.viewIdResourceName ?: ""
-            val className = node.className?.toString() ?: ""
 
             val matchesViewIdPattern = contactPatterns.any { pattern ->
                 viewId.contains(pattern, ignoreCase = true)
-            }
-
-            val matchesClassPattern = classPatterns.any { pattern ->
-                className.contains(pattern, ignoreCase = true)
             }
 
             val timePattern = Regex("^\\d{1,2}:\\d{2}$")
@@ -1274,7 +1260,7 @@ private suspend fun captureNewMessages() {
                 !text.contains("Missed", ignoreCase = true) &&
                 text != "@"
 
-            if ((matchesViewIdPattern || matchesClassPattern) && isValidContact) {
+            if (matchesViewIdPattern && isValidContact) {
                 contacts.add(text)
             }
         }
