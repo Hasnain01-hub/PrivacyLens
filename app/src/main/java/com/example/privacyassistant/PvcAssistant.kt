@@ -67,6 +67,14 @@ It does the following:
  */
 class PvcAssistant : ComponentActivity() {
 
+    private val classificationViewModel: ContactClassificationViewModel by viewModels {
+    object : ViewModelProvider.Factory {
+        override fun <T : ViewModel> create(modelClass: Class<T>): T {
+            @Suppress("UNCHECKED_CAST")
+            return ContactClassificationViewModel(application) as T
+        }
+    }
+}
     private val NOTIFICATION_PERMISSION_REQUEST_CODE = 1001
 
     private lateinit var dbHandler: DBHandler
@@ -391,14 +399,7 @@ private fun checkMonitoringStatus(): String {
         "Service not running"
     }
 }
-private val classificationViewModel: ContactClassificationViewModel by viewModels {
-    object : ViewModelProvider.Factory {
-        override fun <T : ViewModel> create(modelClass: Class<T>): T {
-            @Suppress("UNCHECKED_CAST")
-            return ContactClassificationViewModel(application) as T
-        }
-    }
-}
+
 
     @Composable
     fun WelcomeScreen(

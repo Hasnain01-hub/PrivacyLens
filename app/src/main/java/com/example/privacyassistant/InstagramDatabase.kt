@@ -205,7 +205,8 @@ data class MessageWithReadableTime(
 data class AppUsage(
     @PrimaryKey val id: Int = 1, // singleton row
     val firstOpenMs: Long,
-    val lastOpenMs: Long
+    val lastOpenMs: Long,
+    val lastClassifiedMs: Long = 0L
 )
 
 @Dao
@@ -215,6 +216,9 @@ interface AppUsageDao {
 
     @Query("UPDATE app_usage SET lastOpenMs = :now WHERE id = 1")
     suspend fun updateLastOpen(now: Long)
+    
+    @Query("UPDATE app_usage SET lastClassifiedMs = :time WHERE id = 1")
+    suspend fun updateLastClassified(time: Long)
 
     @Query("SELECT * FROM app_usage WHERE id = 1")
     suspend fun get(): AppUsage?

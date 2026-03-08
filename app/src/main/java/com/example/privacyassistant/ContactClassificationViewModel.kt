@@ -45,34 +45,36 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun bootstrap() {
-        val now = System.currentTimeMillis()
+    val now = System.currentTimeMillis()
 
-        // Record first open (IGNORE if already exists), update last open
-        appUsageDao.insertIfAbsent(AppUsage(firstOpenMs = now, lastOpenMs = now))
-        appUsageDao.updateLastOpen(now)
+    appUsageDao.insertIfAbsent(AppUsage(firstOpenMs = now, lastOpenMs = now))
+    appUsageDao.updateLastOpen(now)
 
-        val usage = appUsageDao.get() ?: return
-        val elapsed = now - usage.firstOpenMs
+    val usage = appUsageDao.get() ?: return
 
-        if (elapsed < ONE_MONTH_MS) {
-            _state.value = ClassificationScreenState.NotDueYet
-            return
-        }
+    // Use lastClassifiedMs if it exists, otherwise fall back to firstOpenMs
+    val referenceTime = if (usage.lastClassifiedMs > 0L) usage.lastClassifiedMs 
+                        else usage.firstOpenMs
+    val elapsed = now - referenceTime
 
-        // Contacts not yet classified
-        val alreadyDone = relationDao.getAllClassifiedNames().toSet()
-        val allContacts = contactDao.getAllContacts().map { it.name }
-        val pending = allContacts.filter { it !in alreadyDone }
-
-        if (pending.isEmpty()) {
-            _state.value = ClassificationScreenState.NoContacts
-            return
-        }
-
-        _state.value = ClassificationScreenState.Ready(
-            pending.map { ClassifiableContact(it) }
-        )
+    if (elapsed < ONE_MONTH_MS) {
+        _state.value = ClassificationScreenState.NotDueYet
+        return
     }
+
+    val alreadyDone = relationDao.getAllClassifiedNames().toSet()
+    val allContacts = contactDao.getAllContacts().map { it.name }
+    val pending = allContacts.filter { it !in alreadyDone }
+
+    if (pending.isEmpty()) {
+        _state.value = ClassificationScreenState.NoContacts
+        return
+    }
+
+    _state.value = ClassificationScreenState.Ready(
+        pending.map { ClassifiableContact(it) }
+    )
+}
 
     fun setRelation(contactName: String, relation: ContactRelation) {
         _selections.value = _selections.value + (contactName to relation)
@@ -81,7 +83,7 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
 fun onSelect(name: String, relation: ContactRelation) = setRelation(name, relation)
 
 
- fun saveAndFinish() {
+fun saveAndFinish() {
     viewModelScope.launch {
         val now = System.currentTimeMillis()
         _selections.value.forEach { (name, relation) ->
@@ -92,10 +94,13 @@ fun onSelect(name: String, relation: ContactRelation) = setRelation(name, relati
                     classifiedAtMs = now
                 )
             )
-            remoteSyncHelper.syncContactRelation(name, relation)  // ADD THIS
+            remoteSyncHelper.syncContactRelation(name, relation)
         }
+        // Reset the clock here — next classification due in 1 month from now
+        appUsageDao.updateLastClassified(now)
         _state.value = ClassificationScreenState.Done
     }
 }
+
 fun saveClassifications() = saveAndFinish()
 }
