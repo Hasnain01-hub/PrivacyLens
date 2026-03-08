@@ -36,7 +36,6 @@ class TimeConverters {
     }
 }
 
-// Asset types for messages
 object AssetType {
     const val TEXT = "text"
     const val IMAGE = "image"
@@ -44,7 +43,10 @@ object AssetType {
     const val GIF = "gif"
     const val STICKER = "sticker"
     const val VOICE_NOTE = "voice_note"
-    const val GIFT = "gift" 
+    const val GIFT = "gift"
+    const val REEL = "reel"
+    const val AUDIO_CALL = "audio_call"
+    const val VIDEO_CALL = "video_call"
 }
 
 @Entity(
@@ -57,13 +59,13 @@ data class Message(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
     val contactName: String,
     val messageText: String = "",
-    val timestamp: String? = null,
+    val date: String? = null,
+    val time: String? = null,
+    val groupLabelMessageId: Long? = null,
     val isSentByUser: Boolean = false,
     val assetType: String = AssetType.TEXT,
-    val replyMessage: String? = null,
-    val replyMessageID: Long? = null,
     val fingerprint: String,
-    val previousMessageId: Long? = null
+    val duration: String? = null
 )
 
 
@@ -78,7 +80,6 @@ interface ContactDao {
     @Query("SELECT * FROM contacts WHERE name = :name LIMIT 1")
     suspend fun getContactByName(name: String): Contact?
 
-    // Query with readable timestamp for debugging/export
     @Query("""
         SELECT
             id,
@@ -91,32 +92,25 @@ interface ContactDao {
     suspend fun getAllContactsWithReadableTime(): List<ContactWithReadableTime>
 }
 
-// Data class for contacts with readable timestamp
 data class ContactWithReadableTime(
     val id: Long,
     val name: String,
     val timestamp: Long,
-    val readableTime: String  // e.g., "2024-12-30 16:15:17"
+    val readableTime: String
 )
 
 @Dao
 interface MessageDao {
-    @Insert
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(message: Message): Long
-
-    @Query("SELECT id FROM messages WHERE contactName = :contactName AND fingerprint = :fingerprint LIMIT 1")
-    suspend fun getExistingIdByFingerprint(contactName: String, fingerprint: String): Long?
 
     @Query("SELECT * FROM messages WHERE id = :messageId LIMIT 1")
     suspend fun getMessageById(messageId: Long): Message?
-    
-    @Query("SELECT id FROM messages WHERE contactName = :contactName ORDER BY rowid DESC LIMIT 1")
-    suspend fun getLastMessageId(contactName: String): Long?
 
-    @Query("SELECT * FROM messages WHERE contactName = :contactName ORDER BY timestamp ASC")
+    @Query("SELECT * FROM messages WHERE contactName = :contactName ORDER BY date ASC, id ASC")
     suspend fun getMessagesByContact(contactName: String): List<Message>
 
-    @Query("SELECT DISTINCT contactName FROM messages ORDER BY timestamp DESC")
+    @Query("SELECT DISTINCT contactName FROM messages ORDER BY id DESC")
     suspend fun getAllContactNames(): List<String>
 
     @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText LIMIT 1")
@@ -125,42 +119,88 @@ interface MessageDao {
     @Query("SELECT COUNT(*) FROM messages")
     suspend fun getMessageCount(): Int
 
-    @Query("SELECT * FROM messages ORDER BY timestamp DESC")
+    @Query("SELECT * FROM messages ORDER BY id DESC")
     suspend fun getAllMessages(): List<Message>
 
-    // Query with readable timestamp for debugging/export
     @Query("""
         SELECT
             id,
             contactName,
             messageText,
-            timestamp,
-            datetime(timestamp/1000, 'unixepoch', 'localtime') as readableTime,
+            date,
+            time,
+            groupLabelMessageId,
             isSentByUser,
             assetType,
-            replyMessage,
-            replyMessageID
+            duration
         FROM messages
-        ORDER BY timestamp DESC
+        ORDER BY id DESC
     """)
     suspend fun getAllMessagesWithReadableTime(): List<MessageWithReadableTime>
 
-    // Find duplicate message including asset type
     @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText AND assetType = :assetType LIMIT 1")
     suspend fun findDuplicateMessageWithAsset(contactName: String, messageText: String, assetType: String): Message?
 
-    // Find recent voice message from contact (within time window to detect duplicates)
-    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = 'voice_note' AND timestamp > :afterTimestampReadable ORDER BY timestamp DESC LIMIT 1")
-    suspend fun findRecentVoiceMessage(contactName: String, afterTimestampReadable: String): Message?
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = 'voice_note' AND id > :afterId ORDER BY id DESC LIMIT 1")
+    suspend fun findRecentVoiceMessage(contactName: String, afterId: Long): Message?
 
-    // Find recent media of specific type from contact (within time window to detect duplicates)
-    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = :assetType AND timestamp > :afterTimestampReadable ORDER BY timestamp DESC LIMIT 1")
-    suspend fun findRecentMedia(contactName: String, assetType: String, afterTimestampReadable: String): Message?
+    @Query("SELECT * FROM messages WHERE contactName = :contactName AND assetType = :assetType AND id > :afterId ORDER BY id DESC LIMIT 1")
+    suspend fun findRecentMedia(contactName: String, assetType: String, afterId: Long): Message?
 
+    @Query("SELECT id FROM messages WHERE contactName = :contactName AND fingerprint = :fingerprint LIMIT 1")
+    suspend fun getIdByFingerprint(contactName: String, fingerprint: String): Long?
 
-    // Find message by contact and text (for reply lookup)
-    @Query("SELECT * FROM messages WHERE contactName = :contactName AND messageText = :messageText ORDER BY timestamp DESC LIMIT 1")
-    suspend fun findMessageByText(contactName: String, messageText: String): Message?
+    @Query("SELECT id FROM messages WHERE contactName = :contactName AND date = :date AND time = :time AND groupLabelMessageId IS NULL LIMIT 1")
+    suspend fun getFirstMessageIdByDateAndTime(contactName: String, date: String, time: String): Long?
+
+    @Query("SELECT id FROM messages WHERE contactName = :contactName AND date = :date AND groupLabelMessageId IS NULL ORDER BY id ASC LIMIT 1")
+    suspend fun getFirstMessageIdByDate(contactName: String, date: String): Long?
+
+    @Query("""
+        SELECT assetType, isSentByUser, COUNT(*) as cnt
+        FROM messages
+        WHERE contactName = :contactName AND assetType != 'text'
+        GROUP BY assetType, isSentByUser
+    """)
+    suspend fun getMediaCounts(contactName: String): List<MediaTypeCount>
+
+    @Query("SELECT fingerprint FROM messages WHERE contactName = :contactName")
+    suspend fun getFingerprints(contactName: String): List<String>
+
+    @Query("SELECT COUNT(*) FROM messages WHERE contactName = :contactName AND messageText = :messageText AND isSentByUser = :isSentByUser AND assetType = 'text'")
+    suspend fun countTextByContent(contactName: String, messageText: String, isSentByUser: Boolean): Int
+
+    @Query("UPDATE messages SET time = NULL, groupLabelMessageId = :newFirstId WHERE id = :oldFirstId")
+    suspend fun demoteFromFirst(oldFirstId: Long, newFirstId: Long)
+
+    @Query("UPDATE messages SET groupLabelMessageId = :newFirstId WHERE contactName = :contactName AND groupLabelMessageId = :oldFirstId")
+    suspend fun reassignGroupRef(contactName: String, oldFirstId: Long, newFirstId: Long)
+
+}
+
+data class MediaTypeCount(
+    val assetType: String,
+    val isSentByUser: Boolean,
+    val cnt: Int
+)
+
+data class MessageWithReadableTime(
+    val id: Long,
+    val contactName: String,
+    val messageText: String?,
+    val date: String?,
+    val time: String?,
+    val groupLabelMessageId: Long?,
+    val isSentByUser: Boolean,
+    val assetType: String,
+    val duration: String?
+) {
+    val readableTime: String
+        get() = when {
+            date != null && time != null -> "$date $time"
+            date != null -> date
+            else -> "unknown"
+        }
 }
 
 // Data class for messages with readable timestamp
@@ -178,8 +218,8 @@ data class MessageWithReadableTime(
 
 @Database(
     entities = [Contact::class, Message::class],
-    version = 6, 
-    exportSchema = true  // Changed to true for debugging
+    version = 12,
+    exportSchema = true
 )
 @androidx.room.TypeConverters(TimeConverters::class)
 abstract class InstagramDatabase : androidx.room.RoomDatabase(){
@@ -198,7 +238,7 @@ abstract class InstagramDatabase : androidx.room.RoomDatabase(){
                     "instagram-db"
                 )
                 .fallbackToDestructiveMigration()
-                .setJournalMode(JournalMode.TRUNCATE)  // Better for debugging
+                .setJournalMode(JournalMode.TRUNCATE)
                 .addCallback(object : Callback() {
                     override fun onCreate(db: SupportSQLiteDatabase) {
                         super.onCreate(db)
@@ -216,7 +256,6 @@ abstract class InstagramDatabase : androidx.room.RoomDatabase(){
             }
         }
         
-        // Method to check if database file exists
         fun databaseExists(context: android.content.Context): Boolean {
             val dbFile = context.getDatabasePath("instagram-db")
             val exists = dbFile.exists()
