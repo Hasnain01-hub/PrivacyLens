@@ -60,7 +60,7 @@ class MainActivity : ComponentActivity() {
                         ContactClassificationScreen(
                             contacts   = s.contacts,
                             selections = selections,
-                            onSelect   = classificationViewModel::setRelation,
+                            onSelect = classificationViewModel::onSelect,
                             onSave     = classificationViewModel::saveAndFinish
                         )
                     }

@@ -9,7 +9,7 @@ import kotlinx.coroutines.launch
 
 data class ClassifiableContact(
     val name: String,
-    val selectedRelation: ContactRelation? = null
+    val selectedRelations: List<String> = emptyList() 
 )
 
 sealed class ClassificationScreenState {
@@ -33,8 +33,8 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<ClassificationScreenState> = _state
 
     // mutable working copy of selections
-    private val _selections = MutableStateFlow<Map<String, ContactRelation>>(emptyMap())
-    val selections: StateFlow<Map<String, ContactRelation>> = _selections
+    private val _selections = MutableStateFlow<Map<String, List<String>>>(emptyMap())
+    val selections: StateFlow<Map<String, List<String>>> = _selections
     companion object {
         // 1 month in ms, used to determine when to next show classification screen
         const val ONE_MONTH_MS = 60L * 1000
@@ -80,25 +80,25 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch { bootstrap(skipTimeCheck = true) }
     }
 
-    fun setRelation(contactName: String, relation: ContactRelation) {
-        _selections.value = _selections.value + (contactName to relation)
-    }
-
-fun onSelect(name: String, relation: ContactRelation) = setRelation(name, relation)
+fun onSelect(name: String, relationId: String) {
+    val current = _selections.value[name] ?: emptyList()
+    val updated = if (relationId in current) current - relationId else current + relationId
+    _selections.value = _selections.value + (name to updated)
+}
 
 
 fun saveAndFinish() {
     viewModelScope.launch {
         val now = System.currentTimeMillis()
-        _selections.value.forEach { (name, relation) ->
+        _selections.value.forEach { (name, selectedIds) ->
             relationDao.upsert(
                 ContactRelation_Entity(
                     contactName = name,
-                    relation = relation.name,
+                    relationIds = com.google.gson.Gson().toJson(selectedIds), 
                     classifiedAtMs = now
                 )
             )
-            remoteSyncHelper.syncContactRelation(name, relation)
+            remoteSyncHelper.syncContactRelation(name, selectedIds)
         }
         // Reset the clock here — next classification due in 1 month from now
         appUsageDao.updateLastClassified(now)

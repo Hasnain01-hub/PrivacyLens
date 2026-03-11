@@ -33,22 +33,18 @@ private val TextSub   = Color(0xFF7A8499)
 private val Divider   = Color(0xFF252B3B)
 private val ChipUnsel = Color(0xFF252B3B)
 
-private val columns = listOf(
-    ContactRelation.FRIEND        to "Friend",
-    ContactRelation.MUTUAL_FRIEND to "Mutual",
-    ContactRelation.FAMILY        to "Family",
-    ContactRelation.UNKNOWN       to "Unknown"
-)
-
+private val columns = RELATIONSHIP_TYPES.entries.toList()
 
 @Composable
 fun ContactClassificationScreen(
     contacts: List<ClassifiableContact>,     
-    selections: Map<String, ContactRelation>,
-    onSelect: (String, ContactRelation) -> Unit,
+    selections: Map<String, List<String>>,
+    onSelect: (String, String) -> Unit,
     onSave: () -> Unit
 ) {
-    val saveEnabled = contacts.isNotEmpty() && selections.size == contacts.size
+    val saveEnabled = contacts.isNotEmpty() && contacts.all { 
+    (selections[it.name]?.isNotEmpty() == true) 
+}
 
     Box(
         modifier = Modifier
@@ -152,12 +148,12 @@ fun ContactClassificationScreen(
                         )
 
                         // Radio chips per column
-                        columns.forEach { (relation, _) ->
+                        columns.forEach { (id, _) ->
                             Box(
                                 modifier = Modifier.weight(1f),
                                 contentAlignment = Alignment.Center
                             ) {
-                                val isChecked = selected == relation
+                                val isChecked = id in (selections[contact.name] ?: emptyList())
                                 Box(
                                     modifier = Modifier
                                         .size(22.dp)
@@ -170,7 +166,7 @@ fun ContactClassificationScreen(
                                             color = if (isChecked) Color.Transparent else Color(0xFF3A4155),
                                             shape = RoundedCornerShape(50)
                                         )
-                                        .clickable { onSelect(contact.name, relation) },
+                                        .clickable { onSelect(contact.name, id) },
                                     contentAlignment = Alignment.Center
                                 ) {
                                     if (isChecked) {

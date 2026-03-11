@@ -36,7 +36,7 @@ data class MessageResponse(val id: Long?, val inserted: Boolean)
 data class ContactRelationPayload(
     val contactKey: String,
     val contactNameEnc: String,
-    val relationEnc: String,
+    val relationIds: List<String>, 
     val classifiedAtMs: Long
 )
 
