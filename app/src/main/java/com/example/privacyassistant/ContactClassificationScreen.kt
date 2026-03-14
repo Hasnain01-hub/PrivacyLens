@@ -14,9 +14,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.Font
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -32,19 +31,25 @@ private val TextPrim  = Color(0xFFF0F2F8)
 private val TextSub   = Color(0xFF7A8499)
 private val Divider   = Color(0xFF252B3B)
 private val ChipUnsel = Color(0xFF252B3B)
+private val IgnoreColor = Color(0xFFEF5350)
 
-private val columns = RELATIONSHIP_TYPES.entries.toList()
+private val columns = listOf(
+    ContactRelation.FRIEND        to "Friend",
+    ContactRelation.FAMILY        to "Family",
+    ContactRelation.COLLEAGUE     to "Colleague",
+    ContactRelation.ACQUAINTANCE  to "Acquaint.",
+    ContactRelation.IGNORE        to "Ignore"
+)
+
 
 @Composable
 fun ContactClassificationScreen(
-    contacts: List<ClassifiableContact>,     
-    selections: Map<String, List<String>>,
-    onSelect: (String, String) -> Unit,
+    contacts: List<ClassifiableContact>,
+    selections: Map<String, Set<ContactRelation>>,
+    onSelect: (String, ContactRelation) -> Unit,
     onSave: () -> Unit
 ) {
-    val saveEnabled = contacts.isNotEmpty() && contacts.all { 
-    (selections[it.name]?.isNotEmpty() == true) 
-}
+    val saveEnabled = contacts.isNotEmpty() && contacts.all { selections[it.name]?.isNotEmpty() == true }
 
     Box(
         modifier = Modifier
@@ -82,7 +87,7 @@ fun ContactClassificationScreen(
                     )
                     Spacer(Modifier.height(8.dp))
                     Text(
-                        text = "${contacts.size} contacts · select one category per row",
+                        text = "${contacts.size} contacts · select one or more categories per row",
                         fontSize = 13.sp,
                         color = TextSub
                     )
@@ -94,12 +99,12 @@ fun ContactClassificationScreen(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(BgCard)
-                    .padding(horizontal = 16.dp, vertical = 10.dp),
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Text(
                     text = "Contact",
-                    modifier = Modifier.weight(1.8f),
+                    modifier = Modifier.weight(1.6f),
                     fontSize = 11.sp,
                     letterSpacing = 1.5.sp,
                     fontWeight = FontWeight.SemiBold,
@@ -109,11 +114,11 @@ fun ContactClassificationScreen(
                     Text(
                         text = label.uppercase(),
                         modifier = Modifier.weight(1f),
-                        fontSize = 10.sp,
-                        letterSpacing = 1.sp,
+                        fontSize = 9.sp,
+                        letterSpacing = 0.8.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = TextSub,
-                        textAlign = androidx.compose.ui.text.style.TextAlign.Center
+                        textAlign = TextAlign.Center
                     )
                 }
             }
@@ -126,20 +131,20 @@ fun ContactClassificationScreen(
                 contentPadding = PaddingValues(bottom = 8.dp)
             ) {
                 itemsIndexed(contacts) { index, contact ->
-                    val selected = selections[contact.name]
+                    val selectedSet = selections[contact.name] ?: emptySet()
                     val rowBg = if (index % 2 == 0) BgRow else BgRowAlt
 
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .background(rowBg)
-                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                            .padding(horizontal = 12.dp, vertical = 12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         // Contact name
                         Text(
                             text = contact.name,
-                            modifier = Modifier.weight(1.8f),
+                            modifier = Modifier.weight(1.6f),
                             fontSize = 14.sp,
                             fontWeight = FontWeight.Medium,
                             color = TextPrim,
@@ -147,31 +152,39 @@ fun ContactClassificationScreen(
                             overflow = TextOverflow.Ellipsis
                         )
 
-                        // Radio chips per column
-                        columns.forEach { (id, _) ->
+                        // Checkbox chips per column
+                        columns.forEach { (relation, _) ->
                             Box(
                                 modifier = Modifier.weight(1f),
                                 contentAlignment = Alignment.Center
                             ) {
-                                val isChecked = id in (selections[contact.name] ?: emptyList())
+                                val isChecked = selectedSet.contains(relation)
+                                val chipColor = when {
+                                    isChecked && relation == ContactRelation.IGNORE -> IgnoreColor
+                                    isChecked -> Accent
+                                    else -> ChipUnsel
+                                }
+                                val borderColor = when {
+                                    isChecked -> Color.Transparent
+                                    relation == ContactRelation.IGNORE -> Color(0xFF5A3A3A)
+                                    else -> Color(0xFF3A4155)
+                                }
                                 Box(
                                     modifier = Modifier
                                         .size(22.dp)
-                                        .clip(RoundedCornerShape(50))
-                                        .background(
-                                            if (isChecked) Accent else ChipUnsel
-                                        )
+                                        .clip(RoundedCornerShape(4.dp))
+                                        .background(chipColor)
                                         .border(
                                             width = if (isChecked) 0.dp else 1.5.dp,
-                                            color = if (isChecked) Color.Transparent else Color(0xFF3A4155),
-                                            shape = RoundedCornerShape(50)
+                                            color = borderColor,
+                                            shape = RoundedCornerShape(4.dp)
                                         )
-                                        .clickable { onSelect(contact.name, id) },
+                                        .clickable { onSelect(contact.name, relation) },
                                     contentAlignment = Alignment.Center
                                 ) {
                                     if (isChecked) {
                                         Text(
-                                            text = "✓",
+                                            text = "\u2713",
                                             fontSize = 12.sp,
                                             color = Color.White,
                                             fontWeight = FontWeight.Bold
@@ -197,17 +210,18 @@ fun ContactClassificationScreen(
                         .fillMaxWidth()
                         .padding(horizontal = 20.dp, vertical = 16.dp)
                 ) {
+                    val classifiedCount = contacts.count { selections[it.name]?.isNotEmpty() == true }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
                         Text(
-                            text = "${selections.size} of ${contacts.size} classified",
+                            text = "$classifiedCount of ${contacts.size} classified",
                             fontSize = 12.sp,
                             color = TextSub
                         )
                         Text(
-                            text = "${((selections.size.toFloat() / contacts.size) * 100).toInt()}%",
+                            text = "${((classifiedCount.toFloat() / contacts.size) * 100).toInt()}%",
                             fontSize = 12.sp,
                             color = Accent,
                             fontWeight = FontWeight.SemiBold
@@ -215,7 +229,7 @@ fun ContactClassificationScreen(
                     }
                     Spacer(Modifier.height(8.dp))
                     LinearProgressIndicator(
-                        progress = { selections.size.toFloat() / contacts.size },
+                        progress = { classifiedCount.toFloat() / contacts.size },
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(4.dp)

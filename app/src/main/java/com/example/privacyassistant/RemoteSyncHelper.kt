@@ -77,21 +77,23 @@ class RemoteSyncHelper(context: Context) {
         }
     }
 
-    suspend fun syncContactRelation(contactName: String, relationIds: List<String>) {
+    suspend fun syncContactRelations(contactName: String, relations: Set<ContactRelation>) {
     try {
         val contactKey = CryptoHelper.hmacContactKey(contactName, encryptionKey)
         val contactNameEnc = CryptoHelper.encrypt(contactName, encryptionKey)
+        val relationStr = relations.joinToString(",") { it.name } // e.g. "FRIEND,FAMILY"
+        val relationEnc = CryptoHelper.encrypt(relationStr, encryptionKey)
 
         val payload = ContactRelationPayload(
             contactKey = contactKey,
             contactNameEnc = contactNameEnc,
-            relationIds = relationIds, 
+            relationEnc = relationEnc,
             classifiedAtMs = System.currentTimeMillis()
         )
 
         val response = RemoteApiService.api.upsertContactRelation(payload, AUTH_HEADER)
         if (response.isSuccessful) {
-            Log.d(TAG, "✅ Relation synced: ${contactKey.take(8)}… → ${relationIds}")
+            Log.d(TAG, "✅ Relation synced: ${contactKey.take(8)}… → $relationStr")
         } else {
             Log.w(TAG, "⚠️ Relation sync failed: HTTP ${response.code()}")
         }

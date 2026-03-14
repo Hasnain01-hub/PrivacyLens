@@ -228,18 +228,12 @@ interface AppUsageDao {
 }
 
 // ── Contact classification ───────────────────────────────────
-val RELATIONSHIP_TYPES = mapOf(
-    "1" to "Friends",
-    "2" to "Family",
-    "3" to "Colleague",
-    "4" to "Acquaintance",
-    "5" to "Ignore"
-)
+enum class ContactRelation { FRIEND, FAMILY, COLLEAGUE, ACQUAINTANCE, IGNORE }
 
 @Entity(tableName = "contact_relations")
 data class ContactRelation_Entity(
     @PrimaryKey val contactName: String,
-    val relationIds: String,
+    val relation: String,           // comma-separated ContactRelation names, e.g. "FRIEND,FAMILY"
     val classifiedAtMs: Long = System.currentTimeMillis()
 )
 

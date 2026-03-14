@@ -9,7 +9,7 @@ import kotlinx.coroutines.launch
 
 data class ClassifiableContact(
     val name: String,
-    val selectedRelations: List<String> = emptyList() 
+    val selectedRelation: ContactRelation? = null
 )
 
 sealed class ClassificationScreenState {
@@ -28,13 +28,14 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
     private val contactDao = db.contactDao()
     private val appUsageDao = db.appUsageDao()
     private val relationDao = db.contactRelationDao()
-    private val remoteSyncHelper = RemoteSyncHelper(app)  
+    private val remoteSyncHelper = RemoteSyncHelper(app)
     private val _state = MutableStateFlow<ClassificationScreenState>(ClassificationScreenState.Loading)
     val state: StateFlow<ClassificationScreenState> = _state
 
-    // mutable working copy of selections
-    private val _selections = MutableStateFlow<Map<String, List<String>>>(emptyMap())
-    val selections: StateFlow<Map<String, List<String>>> = _selections
+    // Multi-select: each contact maps to a set of selected relations
+    private val _selections = MutableStateFlow<Map<String, Set<ContactRelation>>>(emptyMap())
+    val selections: StateFlow<Map<String, Set<ContactRelation>>> = _selections
+
     companion object {
         // 1 month in ms, used to determine when to next show classification screen
         const val ONE_MONTH_MS = 60L * 1000
@@ -45,66 +46,85 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     private suspend fun bootstrap(skipTimeCheck: Boolean) {
-    val now = System.currentTimeMillis()
+        val now = System.currentTimeMillis()
 
-    appUsageDao.insertIfAbsent(AppUsage(firstOpenMs = now, lastOpenMs = now))
-    appUsageDao.updateLastOpen(now)
+        appUsageDao.insertIfAbsent(AppUsage(firstOpenMs = now, lastOpenMs = now))
+        appUsageDao.updateLastOpen(now)
 
-    if (!skipTimeCheck) {
-        val usage = appUsageDao.get() ?: return
-        val referenceTime = if (usage.lastClassifiedMs > 0L) usage.lastClassifiedMs
-                            else usage.firstOpenMs
-        val elapsed = now - referenceTime
+        if (!skipTimeCheck) {
+            val usage = appUsageDao.get() ?: return
+            val referenceTime = if (usage.lastClassifiedMs > 0L) usage.lastClassifiedMs
+                                else usage.firstOpenMs
+            val elapsed = now - referenceTime
 
-        if (elapsed < ONE_MONTH_MS) {
-            _state.value = ClassificationScreenState.NotDueYet
+            if (elapsed < ONE_MONTH_MS) {
+                _state.value = ClassificationScreenState.NotDueYet
+                return
+            }
+        }
+
+        val alreadyDone = relationDao.getAllClassifiedNames().toSet()
+        val allContacts = contactDao.getAllContacts().map { it.name }
+        val pending = allContacts.filter { it !in alreadyDone }
+
+        if (pending.isEmpty()) {
+            _state.value = ClassificationScreenState.NoContacts
             return
         }
+
+        _state.value = ClassificationScreenState.Ready(
+            pending.map { ClassifiableContact(it) }
+        )
     }
-
-    val alreadyDone = relationDao.getAllClassifiedNames().toSet()
-    val allContacts = contactDao.getAllContacts().map { it.name }
-    val pending = allContacts.filter { it !in alreadyDone }
-
-    if (pending.isEmpty()) {
-        _state.value = ClassificationScreenState.NoContacts
-        return
-    }
-
-    _state.value = ClassificationScreenState.Ready(
-        pending.map { ClassifiableContact(it) }
-    )
-}
 
     fun forceShowClassification() {
         viewModelScope.launch { bootstrap(skipTimeCheck = true) }
     }
 
-fun onSelect(name: String, relationId: String) {
-    val current = _selections.value[name] ?: emptyList()
-    val updated = if (relationId in current) current - relationId else current + relationId
-    _selections.value = _selections.value + (name to updated)
-}
+    fun toggleRelation(contactName: String, relation: ContactRelation) {
+        val current = _selections.value[contactName] ?: emptySet()
 
-
-fun saveAndFinish() {
-    viewModelScope.launch {
-        val now = System.currentTimeMillis()
-        _selections.value.forEach { (name, selectedIds) ->
-            relationDao.upsert(
-                ContactRelation_Entity(
-                    contactName = name,
-                    relationIds = com.google.gson.Gson().toJson(selectedIds), 
-                    classifiedAtMs = now
-                )
-            )
-            remoteSyncHelper.syncContactRelation(name, selectedIds)
+        val updated = if (relation == ContactRelation.IGNORE) {
+            // IGNORE is exclusive — selecting it deselects everything else
+            if (current.contains(ContactRelation.IGNORE)) emptySet() else setOf(ContactRelation.IGNORE)
+        } else {
+            // Selecting a non-IGNORE option removes IGNORE if present
+            val withoutIgnore = current - ContactRelation.IGNORE
+            if (withoutIgnore.contains(relation)) {
+                withoutIgnore - relation
+            } else {
+                withoutIgnore + relation
+            }
         }
-        // Reset the clock here — next classification due in 1 month from now
-        appUsageDao.updateLastClassified(now)
-        _state.value = ClassificationScreenState.Done
-    }
-}
 
-fun saveClassifications() = saveAndFinish()
+        _selections.value = if (updated.isEmpty()) {
+            _selections.value - contactName
+        } else {
+            _selections.value + (contactName to updated)
+        }
+    }
+
+    fun onSelect(name: String, relation: ContactRelation) = toggleRelation(name, relation)
+
+    fun saveAndFinish() {
+        viewModelScope.launch {
+            val now = System.currentTimeMillis()
+            _selections.value.forEach { (name, relations) ->
+                // Store as comma-separated string, e.g. "FRIEND,FAMILY"
+                val relationStr = relations.joinToString(",") { it.name }
+                relationDao.upsert(
+                    ContactRelation_Entity(
+                        contactName = name,
+                        relation = relationStr,
+                        classifiedAtMs = now
+                    )
+                )
+                remoteSyncHelper.syncContactRelations(name, relations)
+            }
+            appUsageDao.updateLastClassified(now)
+            _state.value = ClassificationScreenState.Done
+        }
+    }
+
+    fun saveClassifications() = saveAndFinish()
 }
