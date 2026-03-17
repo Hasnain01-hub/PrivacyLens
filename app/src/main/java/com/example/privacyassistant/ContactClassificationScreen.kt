@@ -36,7 +36,7 @@ private val IgnoreColor = Color(0xFFEF5350)
 private val columns = listOf(
     ContactRelation.FRIEND        to "Friend",
     ContactRelation.FAMILY        to "Family",
-    ContactRelation.COLLEAGUE     to "Colleague",
+    ContactRelation.COLLEAGUE     to "Colleg.",
     ContactRelation.ACQUAINTANCE  to "Acquaint.",
     ContactRelation.IGNORE        to "Ignore"
 )
@@ -114,11 +114,13 @@ fun ContactClassificationScreen(
                     Text(
                         text = label.uppercase(),
                         modifier = Modifier.weight(1f),
-                        fontSize = 9.sp,
-                        letterSpacing = 0.8.sp,
+                        fontSize = 8.sp,
+                        letterSpacing = 0.5.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = TextSub,
-                        textAlign = TextAlign.Center
+                        textAlign = TextAlign.Center,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
                 }
             }
