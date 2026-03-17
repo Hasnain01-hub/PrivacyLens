@@ -64,7 +64,7 @@ Before any personal data leaves the device:
 
 - Hosted on a **GWDG cloud VM** (University of Göttingen / Max Planck Society)
 - Ubuntu 22.04.5 LTS, x86_64, SSD-backed, `m1.medium` flavour
-- IP: `141.5.101.126`, port `8080`
+- IP: `141.5.108.226`, port `8080`
 
 ### Stack
 
