@@ -38,7 +38,7 @@ class ContactClassificationViewModel(app: Application) : AndroidViewModel(app) {
 
     companion object {
         // 1 month in ms, used to determine when to next show classification screen
-        const val ONE_MONTH_MS = 60L * 1000
+        const val ONE_MONTH_MS = 30L * 24 * 60 * 60 * 1000
     }
 
     init {

@@ -31,7 +31,6 @@ class InstagramAccessibilityService : AccessibilityService() {
     companion object {
         const val TAG = "InstagramAccessibility"
         const val INSTAGRAM_PACKAGE = "com.instagram.android"
-        const val ULTRA_DEEP_LOGGING = true
         private var instance: InstagramAccessibilityService? = null
         fun getInstance(): InstagramAccessibilityService? = instance
     }
@@ -112,17 +111,11 @@ class InstagramAccessibilityService : AccessibilityService() {
 
     ioScope.launch {
         try {
-            val contacts = contactDao.getAllContacts()
-            Log.d(TAG, "Database initialized. Existing contacts: ${contacts.size}")
-
-            val dbPath = applicationContext.getDatabasePath("instagram-db").absolutePath
-            Log.d(TAG, "Database path: $dbPath")
+            contactDao.getAllContacts()
         } catch (e: Exception) {
             Log.e(TAG, "Database initialization error: ${e.message}")
         }
     }
-
-    Log.d(TAG, "Service initialized and ready to monitor Instagram")
 
     // Start periodic classification notification check
     startClassificationCheckLoop()
@@ -136,7 +129,6 @@ class InstagramAccessibilityService : AccessibilityService() {
                 try {
                     val allContacts = contactDao.getAllContacts()
                     if (allContacts.isEmpty()) {
-                        Log.d(TAG, "Classification check: no contacts captured yet, skipping")
                         continue
                     }
 
@@ -144,11 +136,9 @@ class InstagramAccessibilityService : AccessibilityService() {
                     val unclassified = allContacts.filter { it.name !in alreadyClassified }
 
                     if (unclassified.isEmpty()) {
-                        Log.d(TAG, "Classification check: all ${allContacts.size} contacts already classified")
                         continue
                     }
 
-                    Log.d(TAG, "Classification check: ${unclassified.size} unclassified contacts found, showing notification")
                     notificationHelper.showContactClassificationNotification()
                 } catch (e: Exception) {
                     Log.e(TAG, "Classification check error: ${e.message}")
@@ -162,34 +152,6 @@ class InstagramAccessibilityService : AccessibilityService() {
             val packageName = event.packageName?.toString()
 
             if (packageName != INSTAGRAM_PACKAGE) return
-
-            val eventTypeName = when (event.eventType) {
-                AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> "WINDOW_STATE_CHANGED"
-                AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED -> "WINDOW_CONTENT_CHANGED"
-                AccessibilityEvent.TYPE_VIEW_CLICKED -> "VIEW_CLICKED"
-                AccessibilityEvent.TYPE_VIEW_FOCUSED -> "VIEW_FOCUSED"
-                AccessibilityEvent.TYPE_VIEW_SCROLLED -> "VIEW_SCROLLED"
-                else -> "EVENT_${event.eventType}"
-            }
-
-            if (ULTRA_DEEP_LOGGING) {
-                Log.d(TAG, "🔔 EVENT: $eventTypeName | class=${event.className} | pkg=$packageName")
-                if (event.eventType == AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) {
-                    val cls = event.className?.toString() ?: ""
-                    val lower = cls.lowercase()
-                    if (lower.contains("reel") || lower.contains("clip") || lower.contains("video") ||
-                        lower.contains("call") || lower.contains("voip") || lower.contains("audio") ||
-                        lower.contains("ring") || lower.contains("phone")) {
-                        Log.d(TAG, "🎯 REEL/CALL ACTIVITY DETECTED: '$cls'")
-                        val root = rootInActiveWindow
-                        if (root != null) {
-                            Log.d(TAG, "🌳 DUMPING UI TREE FOR REEL/CALL SCREEN:")
-                            dumpUITree(root, maxDepth = 15)
-                            root.recycle()
-                        }
-                    }
-                }
-            }
 
             when (event.eventType) {
                 AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED -> {
@@ -881,7 +843,6 @@ fun exportDataToFile() {
                 }
             }
 
-            Log.d(TAG, "Data exported to: ${exportFile.absolutePath}")
         } catch (e: Exception) {
             Log.e(TAG, "Export failed: ${e.message}")
         }
@@ -897,16 +858,13 @@ fun exportDataToFile() {
             }
 
             val contactName = findCurrentChatContact()
-            Log.d(TAG, "🔍 CHAT CONTACT DETECTION: found='$contactName' current='$currentChatContact'")
             if (contactName != null && contactName != currentChatContact) {
-                Log.d(TAG, "📱 OPENED CHAT WITH: '$contactName'")
                 currentChatContact = contactName
 
                 pendingMessages.clear()
                 saveContact(contactName)
                 delay(800)
                 captureNewMessages()
-                Log.d(TAG, "📨 Auto-captured messages on chat open")
             }
         }
     }
@@ -942,18 +900,11 @@ private fun normalizeDesc(raw: String): String =
 
 private suspend fun captureNewMessages() {
     if (!scanMutex.tryLock()) {
-        Log.d(TAG, "⏭️ SCAN already in progress, skipping")
         return
     }
     try {
         val rootNode = rootInActiveWindow ?: return
         val contactName = currentChatContact ?: "Unknown"
-
-        if (ULTRA_DEEP_LOGGING) {
-            Log.d(TAG, "🌳 === FULL UI TREE DUMP (chat with '$contactName') ===")
-            dumpUITree(rootNode)
-            Log.d(TAG, "🌳 === END UI TREE DUMP ===")
-        }
 
         val detectedMessages = findMessageNodes(rootNode)
 
@@ -962,26 +913,7 @@ private suspend fun captureNewMessages() {
             return
         }
 
-        if (ULTRA_DEEP_LOGGING) {
-            Log.d(TAG, "╔════════════════════════════════════════════╗")
-            Log.d(TAG, "║ SCAN SUMMARY                               ║")
-            Log.d(TAG, "╚════════════════════════════════════════════╝")
-            Log.d(TAG, "  Contact: $contactName")
-            Log.d(TAG, "  Detected messages: ${detectedMessages.size}")
-            detectedMessages.forEachIndexed { index, msg ->
-                Log.d(TAG, "    ${index + 1}. [${msg.assetType}] '${msg.text.take(30)}'")
-            }
-        }
-
         val uiTimestamps = collectUiTimestamps(rootNode)
-
-        if (ULTRA_DEEP_LOGGING) {
-            Log.d(TAG, "⏱️ UI TIMESTAMPS FOUND: ${uiTimestamps.size}")
-            uiTimestamps.take(10).forEach { ts ->
-                Log.d(TAG, "   - '${ts.raw}' -> ${ts.epochMs ?: "unparsed"} (x=${ts.x}, y=${ts.y})")
-            }
-
-        }
 
         data class MsgInfo(
             val detected: DetectedMessage,
@@ -1060,14 +992,8 @@ private suspend fun captureNewMessages() {
                 val labelAlreadyHasMsgs = candidateKey in labelsWithMessages
 
                 if (isClosest && !labelAlreadyHasMsgs) {
-                    if (ULTRA_DEEP_LOGGING) {
-                        Log.d(TAG, "   🔧 QUIRK FIX: msg y=$msgY assigned to label '${candidateLabel.raw}' y=${candidateLabel.y}")
-                    }
                     LabeledMsgInfo(lm.mi, candidateLabel)
                 } else {
-                    if (ULTRA_DEEP_LOGGING) {
-                        Log.d(TAG, "   ⚠️ SKIPPED QUIRK: msg y=$msgY, label '${candidateLabel.raw}' y=${candidateLabel.y} (closest=$isClosest, labelHasMsgs=$labelAlreadyHasMsgs)")
-                    }
                     lm
                 }
             } else {
@@ -1077,14 +1003,6 @@ private suspend fun captureNewMessages() {
 
         val withLabel = finalLabeled.filter { it.label != null }
         val withoutLabel = finalLabeled.filter { it.label == null }
-
-        if (ULTRA_DEEP_LOGGING) {
-            Log.d(TAG, "🔄 PROCESSING ${msgInfos.size} messages: ${withLabel.size} with label, ${withoutLabel.size} without")
-            uiTimestamps.forEach { ts ->
-                Log.d(TAG, "   📅 '${ts.raw}' y=${ts.y} date=${ts.parsedDate} time=${ts.parsedTime}")
-            }
-            Log.d(TAG, "   No-label messages: ${withoutLabel.size} (skipped)")
-        }
 
         val byLabelKey = withLabel.groupBy { lm ->
             val l = lm.label!!
@@ -1101,10 +1019,6 @@ private suspend fun captureNewMessages() {
                 messageDao.getFirstMessageIdByDate(contactName, label.parsedDate!!)
             }
             var firstId = existingFirstFromDB
-
-            if (ULTRA_DEEP_LOGGING) {
-                Log.d(TAG, "   📦 LABEL GROUP '$labelKey': ${sortedByY.size} msgs, existingFirstId=$firstId")
-            }
 
             sortedByY.forEachIndexed { index, lm ->
                 val mi = lm.mi
@@ -1151,15 +1065,11 @@ private suspend fun captureNewMessages() {
                         if (existingFirstFromDB != null && isTopmost) {
                             messageDao.demoteFromFirst(existingFirstFromDB, messageId)
                             messageDao.reassignGroupRef(contactName, existingFirstFromDB, messageId)
-                            Log.d(TAG, "  🔄 REASSIGNED first: old=#$existingFirstFromDB → new=#$messageId")
                         }
                         firstId = messageId
                     }
             val savedMessage = message.copy(id = messageId)
             ioScope.launch { remoteSyncHelper.syncMessage(savedMessage) }
-
-                    val direction = if (mi.isSentByUser) "SENT" else "RECEIVED"
-                    Log.d(TAG, "  ✅ SAVED [${mi.assetType}] [$direction]: '${mi.detected.text.take(50)}' (ID: $messageId, date=${label.parsedDate}, time=$msgTime, groupRef=$msgGroupRef)")
                 } else {
                     if (firstId == null) {
                         val existingId = messageDao.getIdByFingerprint(contactName, fp)
@@ -1169,16 +1079,8 @@ private suspend fun captureNewMessages() {
             }
         }
 
-        if (withoutLabel.isNotEmpty() && ULTRA_DEEP_LOGGING) {
-            Log.d(TAG, "  ⏭️ SKIPPED ${withoutLabel.size} messages without label (will capture on next scan with label)")
-        }
-
         msgInfos.forEach { mi ->
             try { mi.detected.node.recycle() } catch (_: Exception) {}
-        }
-
-        if (newMessageCount > 0) {
-            Log.d(TAG, "📨 Saved $newMessageCount new messages for '$contactName'")
         }
 
         rootNode.recycle()
@@ -1188,34 +1090,6 @@ private suspend fun captureNewMessages() {
         scanMutex.unlock()
     }
 }
-
-    private fun dumpUITree(node: AccessibilityNodeInfo?, depth: Int = 0, maxDepth: Int = 15) {
-        if (node == null || depth > maxDepth) return
-
-        val indent = "  ".repeat(depth)
-        val text = node.text?.toString() ?: ""
-        val contentDesc = node.contentDescription?.toString() ?: ""
-        val viewId = node.viewIdResourceName?.substringAfterLast(':') ?: ""
-        val className = node.className?.toString()?.substringAfterLast('.') ?: ""
-        val bounds = android.graphics.Rect()
-        node.getBoundsInScreen(bounds)
-
-        val info = StringBuilder()
-        info.append("$indent[$className]")
-        if (viewId.isNotEmpty()) info.append(" ID:$viewId")
-        if (text.isNotEmpty()) info.append(" Text:'${text.take(80)}'")
-        if (contentDesc.isNotEmpty()) info.append(" Desc:'${contentDesc.take(80)}'")
-        info.append(" bounds=(${bounds.left},${bounds.top},${bounds.right},${bounds.bottom})")
-
-        Log.d(TAG, info.toString())
-
-        for (i in 0 until node.childCount) {
-            node.getChild(i)?.let { child ->
-                dumpUITree(child, depth + 1, maxDepth)
-                child.recycle()
-            }
-        }
-    }
 
     private suspend fun saveContact(contactName: String) {
     try {
@@ -1227,7 +1101,6 @@ private suspend fun captureNewMessages() {
                 timestamp = System.currentTimeMillis()
             )
             contactDao.insert(contact)
-            Log.d(TAG, "👤 SAVED NEW CONTACT: '$contactName'")
             // Sync to remote — fire and forget, non-blocking
             remoteSyncHelper.syncContact(contact)
         }
@@ -1376,10 +1249,7 @@ private suspend fun captureNewMessages() {
 
                 if (isHeader && isValidContactName) {
                     contactName = text
-                    Log.d(TAG, "✓ HEADER CONTACT: '$text' (viewId: ${viewId.substringAfterLast(':')})")
                     return
-                } else if (isHeader && !isValidContactName) {
-                    Log.d(TAG, "⊘ REJECTED HEADER: '$text' (viewId: ${viewId.substringAfterLast(':')})")
                 }
             }
 
@@ -1429,9 +1299,6 @@ private suspend fun captureNewMessages() {
                 viewIdShort.equals("quoted_message_info", ignoreCase = true) ||
                 viewIdShort.equals("quoted_message_container", ignoreCase = true)
             ) {
-                if (ULTRA_DEEP_LOGGING) {
-                    Log.d(TAG, "🚫 NODE IS INSIDE COMPOSER REPLY BAR: ancestor='$viewIdShort' depth=$depth")
-                }
                 return true
             }
         }
@@ -1530,19 +1397,6 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
             val text = node.text?.toString() ?: ""
             val viewIdShort = viewId.substringAfterLast('/').substringAfterLast(':')
 
-            if (ULTRA_DEEP_LOGGING) {
-                val allLower = "$contentDesc $text $viewIdShort".lowercase()
-                if (allLower.contains("reel") || allLower.contains("clip") ||
-                    allLower.contains("call") || allLower.contains("voip") ||
-                    allLower.contains("missed") || allLower.contains("rang") ||
-                    allLower.contains("ended") || allLower.contains("duration") ||
-                    allLower.contains("shared a reel") || allLower.contains("sent a reel")) {
-                    val bounds = android.graphics.Rect()
-                    node.getBoundsInScreen(bounds)
-                    Log.d(TAG, "🎯 REEL/CALL NODE: viewId='$viewIdShort' class='${className.substringAfterLast('.')}' desc='${contentDesc.take(80)}' text='${text.take(80)}' pos=(${bounds.left},${bounds.top})")
-                }
-            }
-
             if (viewIdShort.equals("reel_share_item_view", ignoreCase = true)) {
                 val bounds = android.graphics.Rect()
                 node.getBoundsInScreen(bounds)
@@ -1560,7 +1414,6 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                             node = AccessibilityNodeInfo.obtain(node)
                         )
                     )
-                    Log.d(TAG, "🎬 REEL DETECTED: '$reelDesc' at pos(${bounds.left},${bounds.top})")
                 }
                 return
             }
@@ -1596,7 +1449,6 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                                 y = bounds.centerY(),
                                 node = AccessibilityNodeInfo.obtain(node)
                             ))
-                            Log.d(TAG, "📞 CALL ENTRY: '$callTitle' time='$callTime' y=${bounds.centerY()}")
                         }
                     }
                     parent.recycle()
@@ -1623,7 +1475,6 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                                         node = AccessibilityNodeInfo.obtain(node)
                                     )
                                 )
-                                Log.d(TAG, "🎁 GIFT DETECTED: '$giftDesc' at pos(${bounds.left},${bounds.top})")
                             }
                              return
                         }
@@ -1642,29 +1493,6 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                 return
             }
 
-            val classShort = className.substringAfterLast('.')
-            val mediaRelatedKeywords = listOf("media", "image", "video", "photo", "picture", "thumbnail", "preview", "playback", "player")
-            val isMediaRelatedViewId = mediaRelatedKeywords.any { keyword ->
-                viewIdShort.contains(keyword, ignoreCase = true)
-            }
-
-            if (isMediaRelatedViewId && viewIdShort.isNotBlank()) {
-                Log.d(TAG, "📷 MEDIA-RELATED VIEW: viewId='$viewIdShort' | class='$classShort' | desc='${contentDesc.take(50)}'")
-            }
-
-            if (className.contains("ImageView", ignoreCase = true)) {
-                val hasDesc = contentDesc.isNotBlank()
-                if (hasDesc) {
-                    Log.d(TAG, "🔍 IMAGEVIEW: desc='$contentDesc' | viewId='$viewIdShort'")
-                } else if (viewIdShort.isNotBlank() && !viewIdShort.contains("avatar") && !viewIdShort.contains("icon")) {
-                    Log.d(TAG, "🔍 IMAGEVIEW (no desc): viewId='$viewIdShort'")
-                }
-            }
-
-            if (className.contains("Video", ignoreCase = true) || className.contains("Player", ignoreCase = true)) {
-                Log.d(TAG, "🎬 VIDEO VIEW: viewId='$viewIdShort' | class='$classShort' | desc='${contentDesc.take(50)}'")
-            }
-
             val matchesValidMediaViewId = validMediaViewIds.any { pattern ->
                 viewIdShort.equals(pattern, ignoreCase = true)
             }
@@ -1677,14 +1505,12 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                 if (!processedMediaIds.contains(mediaId)) {
                     processedMediaIds.add(mediaId)
                     val durationText = text.takeIf { it.isNotBlank() }
-                    Log.d(TAG, "🎤 VOICE MESSAGE DETECTED: viewId='$viewIdShort' text='$text' duration='$durationText' pos=(${bounds.left},${bounds.top})")
                     val voiceText = if (durationText != null) "Voice message ($durationText)" else "Voice message"
                     messages.add(DetectedMessage(
                         text = voiceText,
                         assetType = AssetType.VOICE_NOTE,
                         node = AccessibilityNodeInfo.obtain(node)
                     ))
-                    Log.d(TAG, "✓ DETECTED [voice_note]: '$voiceText'")
                 }
             }
 
@@ -1715,7 +1541,6 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                     node = AccessibilityNodeInfo.obtain(node)
                 )
             )
-            Log.d(TAG, "✓ DETECTED [$assetType]: '$descForKey' at pos(${bounds.left},${bounds.top})")
         }
     }
 }
@@ -1749,32 +1574,13 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                     !timePattern.matches(text)
 
                 if (matchesMessageViewId && isTextView && isNotUIElement && text.length in 1..1000) {
-                    if (ULTRA_DEEP_LOGGING) {
-                        Log.d(TAG, "📋 TEXT NODE FOUND: '$text' | viewId='$viewIdShort'")
-                    }
-
                     if (!isInsideReplyBar(node)) {
                         messages.add(DetectedMessage(
                             text = text,
                             assetType = AssetType.TEXT,
                             node = AccessibilityNodeInfo.obtain(node)
                         ))
-                        if (ULTRA_DEEP_LOGGING) {
-                            Log.d(TAG, "  ✅ ADDED to detection list")
-                        }
-                    } else {
-                        Log.d(TAG, "  ⊘ EXCLUDED (inside reply bar): '$text'")
                     }
-                } else if (ULTRA_DEEP_LOGGING && node.text != null && node.text.isNotEmpty()) {
-                    val text = node.text.toString().trim()
-                    val reason = when {
-                        !matchesMessageViewId -> "viewId doesn't match message patterns"
-                        !isTextView -> "not a TextView"
-                        !isNotUIElement -> "is UI element"
-                        text.length !in 1..1000 -> "text length out of range (${text.length})"
-                        else -> "unknown"
-                    }
-                    Log.v(TAG, "  ⏭️ SKIPPED TEXT NODE: '$text' | Reason: $reason")
                 }
             }
 
@@ -1801,7 +1607,6 @@ fun nodeContainsGiftKeyword(n: AccessibilityNodeInfo?, depth: Int = 0): Boolean 
                         node = AccessibilityNodeInfo.obtain(entry.node)
                     )
                 )
-                Log.d(TAG, "📞 CALL DETECTED [$callAssetType]: '$callText'")
             }
         }
 
