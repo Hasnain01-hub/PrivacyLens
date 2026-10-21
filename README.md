@@ -1,6 +1,6 @@
-# Privacy Assistant — Developer README
+# PrivacyLens
 
-This document is intended for the next developer picking up this project. It covers the project structure, how the Android client works, how the backend is set up, and how to access the cloud server.
+It covers the project structure, how the Android client works, how the backend is set up, and how to access the cloud server.
 
 ---
 
